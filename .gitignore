@@ -1,0 +1,13 @@
+# Secrets: never commit API keys
+.env
+
+# Python virtual environment (recreated with pip install)
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Databases (Stage 2+): may hold patient data
+*.db
+*.sqlite3

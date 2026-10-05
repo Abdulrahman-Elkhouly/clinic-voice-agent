@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nova Mobile Support</title>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    button { font-size: 16px; padding: 12px 20px; border: 0; border-radius: 8px; cursor: pointer; color: #fff; background: #0a7d4f; }
+    button.hangup { background: #b3261e; }
+    #status { color: #666; margin: 12px 0; }
+    #transcript { border-top: 1px solid #ddd; margin-top: 16px; }
+    .line { padding: 8px 0; }
+    .who { font-weight: 600; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Nova Mobile Support</h1>
+  <button id="call">Talk to support</button>
+  <div id="status">Not connected</div>
+  <div id="transcript"></div>
+
+<script>
+  const { Room, RoomEvent, Track } = LivekitClient;
+  const callBtn = document.getElementById("call");
+  const statusEl = document.getElementById("status");
+  const transcriptEl = document.getElementById("transcript");
+  let room = null;
+
+  callBtn.onclick = () => (room ? hangUp() : startCall());
+
+  async function startCall() {
+    callBtn.disabled = true;
+    statusEl.textContent = "Getting a token...";
+
+    // 1. Ask our backend (the front desk) for a key card
+    const { token, url, room: roomName } = await (await fetch("/token")).json();
+
+    room = new Room();
+
+    // 2. When the agent publishes its voice track, play it
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind === Track.Kind.Audio) document.body.appendChild(track.attach());
+    });
+
+    // 3. Live captions: the agent sends transcripts of both sides as text streams
+    room.registerTextStreamHandler("lk.transcription", async (reader, participant) => {
+      const isMe = participant.identity === room.localParticipant.identity;
+      const line = document.createElement("div");
+      line.className = "line";
+      line.innerHTML = `<span class="who">${isMe ? "You" : "Agent"}:</span><span></span>`;
+      transcriptEl.appendChild(line);
+      for await (const chunk of reader) line.lastChild.textContent += chunk;
+    });
+
+    room.on(RoomEvent.Disconnected, resetUi);
+
+    // 4. Join the room with the token, then turn on the mic
+    statusEl.textContent = "Connecting...";
+    await room.connect(url, token);
+    await room.localParticipant.setMicrophoneEnabled(true);
+
+    statusEl.textContent = `Connected to ${roomName}. Waiting for the agent...`;
+    room.on(RoomEvent.ParticipantConnected, () => (statusEl.textContent = "Agent joined. Start talking."));
+    callBtn.textContent = "Hang up";
+    callBtn.className = "hangup";
+    callBtn.disabled = false;
+  }
+
+  async function hangUp() {
+    await room.disconnect();
+  }
+
+  function resetUi() {
+    room = null;
+    statusEl.textContent = "Call ended";
+    callBtn.textContent = "Talk to support";
+    callBtn.className = "";
+    callBtn.disabled = false;
+  }
+</script>
+</body>
+</html>
