@@ -22,6 +22,8 @@ MIN_NOTICE = timedelta(minutes=30)     # nothing bookable sooner than this
 HORIZON = timedelta(days=60)           # nothing bookable further ahead than this
 HOLD_TIME = timedelta(minutes=5)       # an unconfirmed hold expires after this
 LATE_CHANGE = timedelta(hours=4)       # cancelling/moving closer than this is a "late change"
+LOCKOUT_FAILURES = 5                   # failed phone verifications on one file number...
+LOCKOUT_WINDOW = timedelta(hours=24)   # ...within this window lock phone verification for that file
 FILE_NUMBER_DIGITS = 5                 # random digits; a Luhn check digit is added (6 in total)
 
 SCHEMA = """
@@ -90,6 +92,16 @@ CREATE TABLE IF NOT EXISTS appointments (
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_per_slot
     ON appointments(doctor_id, start_at) WHERE status IN ('held', 'booked');
 CREATE INDEX IF NOT EXISTS appointments_by_patient ON appointments(patient_id, start_at);
+
+-- Phone verification attempts per file number, across calls (cross-call lockout).
+-- Recorded for any file number entered, existing or not, so a lockout never reveals that a file exists.
+CREATE TABLE IF NOT EXISTS verification_attempts (
+    attempt_id  INTEGER PRIMARY KEY,
+    file_number TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK (kind IN ('failure', 'success', 'unlock')),
+    at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attempts_by_file ON verification_attempts(file_number, at);
 
 CREATE TABLE IF NOT EXISTS waitlist (
     waitlist_id INTEGER PRIMARY KEY,
@@ -180,10 +192,6 @@ def is_valid_file_number(file_number: str) -> bool:
     """Catches a single misheard digit (and most swapped pairs) before any database lookup."""
     s = "".join(ch for ch in file_number if ch.isdigit())
     return len(s) == FILE_NUMBER_DIGITS + 1 and luhn_check_digit(s[:-1]) == s[-1]
-
-
-def _normalize_name(name: str) -> str:
-    return " ".join(name.lower().split())
 
 
 class ClinicDB:
@@ -335,7 +343,7 @@ class ClinicDB:
     def create_patient(self, full_name: str, dob: date, phone: str, guardian_phone: str | None = None,
                        now: datetime | None = None) -> dict:
         """Registers a patient and returns {patient_id, file_number}. Duplicate checks are the caller's job
-        (find_by_details first), because only the conversation knows whether it's really the same person."""
+        (find_by_dob_phone first), because only the conversation knows whether it's really the same person."""
         now = now or now_qatar()
         with self._write() as conn:
             for _ in range(50):
@@ -362,15 +370,41 @@ class ClinicDB:
         p = self.find_by_file_number(file_number)
         return p if p and p["dob"] == dob.isoformat() else None
 
-    def find_by_details(self, full_name: str, dob: date, phone: str | None = None) -> list[dict]:
-        """Forgot-file-number path: exact name (case and spacing ignored) + DOB, optionally phone."""
+    def find_by_dob_phone(self, dob: date, phone: str) -> list[dict]:
+        """Forgot-file-number path: date of birth + phone, both exact (digits are reliable over STT;
+        names aren't). Matches the patient's own phone or their guardian's."""
+        digits = "".join(ch for ch in phone if ch.isdigit())
         with self._connect() as conn:
             rows = [_row(r) for r in conn.execute("SELECT * FROM patients WHERE dob = ?", (dob.isoformat(),))]
-        rows = [p for p in rows if _normalize_name(p["full_name"]) == _normalize_name(full_name)]
-        if phone:
-            digits = "".join(ch for ch in phone if ch.isdigit())
-            rows = [p for p in rows if "".join(ch for ch in p["phone"] if ch.isdigit()) == digits]
-        return rows
+        only_digits = lambda s: "".join(ch for ch in (s or "") if ch.isdigit())   # noqa: E731
+        return [p for p in rows if digits in (only_digits(p["phone"]), only_digits(p["guardian_phone"]))]
+
+    # --- Cross-call verification lockout ---
+
+    def record_verification(self, file_number: str, success: bool, now: datetime | None = None):
+        now = now or now_qatar()
+        with self._write() as conn:
+            conn.execute("INSERT INTO verification_attempts (file_number, kind, at) VALUES (?, ?, ?)",
+                         (file_number, "success" if success else "failure", _iso(now)))
+
+    def verification_locked(self, file_number: str, now: datetime | None = None) -> bool:
+        """Locked when the file number has LOCKOUT_FAILURES failures within LOCKOUT_WINDOW,
+        counted since the last success or reception unlock."""
+        now = now or now_qatar()
+        with self._connect() as conn:
+            reset = conn.execute("SELECT max(at) FROM verification_attempts WHERE file_number = ?"
+                                 " AND kind IN ('success', 'unlock')", (file_number,)).fetchone()[0]
+            since = max(filter(None, [_iso(now - LOCKOUT_WINDOW), reset]))
+            failures = conn.execute("SELECT count(*) FROM verification_attempts WHERE file_number = ?"
+                                    " AND kind = 'failure' AND at > ?", (file_number, since)).fetchone()[0]
+        return failures >= LOCKOUT_FAILURES
+
+    def unlock_verification(self, file_number: str, now: datetime | None = None):
+        """Reception unlocks a file after confirming the patient in person (staff view, Stage 4c)."""
+        now = now or now_qatar()
+        with self._write() as conn:
+            conn.execute("INSERT INTO verification_attempts (file_number, kind, at) VALUES (?, 'unlock', ?)",
+                         (file_number, _iso(now)))
 
     # --- Holds and bookings ---
 

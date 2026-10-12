@@ -254,10 +254,30 @@ def test_verification_needs_both_file_number_and_dob(clinic):
     assert db.verify_patient(clinic["file1"], date(1990, 3, 15)) is None
 
 
-def test_find_by_details_ignores_case_and_spacing(clinic):
+def test_find_by_dob_phone_matches_digits_only(clinic):
     db = clinic["db"]
-    assert len(db.find_by_details("  fatima   al-naimi ", date(1990, 3, 14))) == 1
-    assert db.find_by_details("Fatima Al-Naimi", date(1990, 3, 14), phone="0000 0000") == []
+    assert len(db.find_by_dob_phone(date(1990, 3, 14), "55123456")) == 1
+    assert len(db.find_by_dob_phone(date(1990, 3, 14), "5512-3456")) == 1
+    assert db.find_by_dob_phone(date(1990, 3, 14), "0000 0000") == []
+    assert db.find_by_dob_phone(date(1990, 3, 15), "5512 3456") == []
+
+
+def test_find_by_dob_phone_matches_the_guardian_phone(clinic):
+    db = clinic["db"]
+    child = db.create_patient("Yousef Al-Kaabi", date(2019, 5, 10), "7000 0000", guardian_phone="3345 6789", now=NOW)
+    assert [p["patient_id"] for p in db.find_by_dob_phone(date(2019, 5, 10), "3345 6789")] == [child["patient_id"]]
+
+
+def test_cross_call_lockout(clinic):
+    db = clinic["db"]
+    for i in range(4):
+        db.record_verification("123455", False, now=NOW + timedelta(minutes=i))
+    assert not db.verification_locked("123455", now=NOW + timedelta(minutes=5))
+    db.record_verification("123455", False, now=NOW + timedelta(minutes=5))
+    assert db.verification_locked("123455", now=NOW + timedelta(minutes=6))
+    assert not db.verification_locked("123455", now=NOW + timedelta(hours=25))   # the window passed
+    db.unlock_verification("123455", now=NOW + timedelta(minutes=7))             # reception unlocked it
+    assert not db.verification_locked("123455", now=NOW + timedelta(minutes=8))
 
 
 # --- Two callers, same slot, same moment (separate processes, like separate calls) ---

@@ -33,6 +33,8 @@ The voice agent is moving from the Nova Mobile telecom demo to the **clinic's re
 | Test results | The agent never reads result values. It can say whether results are ready; values are explained by the doctor. |
 | Topics kept out of the knowledge base | Dental, MRI/CT, home visits, cosmetic surgery, telemedicine. Never mentioned anywhere, so "I don't have that information" can be tested. |
 | Stage order | 1 → 1b → 2 → 3 → 4 → 4b → 4c → 4d → 5 → 6 → 7 → 8 (see Stages) |
+| When the agent can't help | **Transfer the call to staff** (`transfer_to_human`). Never give a number to call instead; the clinic's numbers are given only if asked. Replaces Stage 1's temporary WhatsApp/reception redirects. |
+| Agent structure | Multi-agent: `ReceptionAgent` → `BookingAgent(patient_id)` / `RequestsAgent(patient_id)`, with a shared rules block and shared tools (see the Stage 3 decisions). |
 | Source control | Git, pushed to a private GitHub repo (`Abdulrahman-Elkhouly/clinic-voice-agent`). |
 
 ## Stages
@@ -342,7 +344,49 @@ Upgrade retrieval to production level, one problem at a time so every change in 
   ```
 
 ### Stage 3: Patient identification
-See the full design below.
+See the full design below, including the Stage 3 decisions (multi-agent, DOB + phone for the forgot path with an LLM name judge, cross-call lockout, transfer as the fallback).
+
+#### What was done (Stage 3)
+- **Agent structure:** `InfoAgent` became **`ReceptionAgent`** (greeting, RAG, identification). The prompt was split into **`agent/prompts.py`**: a `SHARED_RULES` block (safety, honesty, KB, transfer, language, speech) written once, plus per-agent parts. Booking and request rules wait there for Stage 4. Shared tools (`search_knowledge_base` and the stubs) are module-level, so every agent can use them.
+- **`agent/identity.py`:** every identification rule, enforced in code and testable without the conversation LLM:
+  - `verify` (file number + DOB), `find` (DOB + phone; the name is asked only for several matches, then sent to the judge), and registration in two steps (`prepare_registration` → `confirm_registration`, with the confirmation gate).
+  - 3 failures per call lock identification. Check-digit errors and impossible dates don't count.
+  - Identical messages whether the file exists or the DOB is wrong. Only the first name is returned on success. The active patient switch is announced.
+  - Logs show `patient_id` only.
+- **`agent/name_judge.py`:** the isolated LLM name judge (see decision 2).
+- **`agent/db.py`:**
+  - `find_by_dob_phone` (matches the patient's own phone or a guardian's) replaced `find_by_details`.
+  - `verification_attempts` table with `record_verification`, `verification_locked` and `unlock_verification` for the cross-call lockout. Attempts are recorded for any file number entered, so a lockout never reveals that a file exists.
+- **`agent/agent.py`:** `ReceptionAgent` with `verify_patient`, `find_patient`, `register_patient`, `confirm_registration`; database calls in threads; `ClinicDB` loaded in `prewarm`; `CallData` holds the call's `CallIdentity`. Stub tools `transfer_to_human` and `log_request`.
+- **Tests: 58 unit tests + 9 name-judge tests + 8 conversation tests, all passing.**
+  - `tests/test_identity.py`, with a fake judge: attempts, lockouts, privacy messages, the confirmation gate, twins, a failed judge.
+  - `tests/test_name_judge.py`, the real judge: English variants, Arabic script, twins, no match, injection.
+  - **`tests/test_conversations.py`**, the real `ReceptionAgent` and LLM in LiveKit's text mode (`session.run`, `expect.contains_message(...).judge(...)`):
+    - verified with file number + DOB (and the birth date is never repeated aloud)
+    - a wrong DOB reveals nothing
+    - forgot path by DOB + phone
+    - no details before verification
+    - impersonation refused
+    - registration only after confirmation
+    - "a real person" is transferred, with no number given
+    - an emergency gets 999 first
+  - The LLM tests are opt-in (`CONVO_TESTS=1`), and pause between tests and turns for Groq's free-tier limit (8,000 tokens per minute).
+- **Ideas used:**
+  - security by construction (tools never return personal data before verification; patient-bound agents come in Stage 4)
+  - an isolated LLM for a narrow decision, kept out of the conversation
+  - confirmation gates enforced in code, not prompts
+  - dependency injection to test LLM-dependent code deterministically
+  - stub tools for anything a prompt names
+  - LLM-as-judge for conversation tests
+- **Tools:** LiveKit Agents 1.8.3 testing helpers, pytest-asyncio (added to `requirements.txt`), Groq `gpt-oss-20b` for the name judge.
+- **`eval_rag.py`:** now loads `ReceptionAgent().instructions`.
+- **Run:**
+
+  ```
+  python -m pytest tests -v
+  $env:CONVO_TESTS=1; python -m pytest tests/test_conversations.py tests/test_name_judge.py -v
+  ```
+- **Not yet:** the handoff to `BookingAgent` (Stage 4), the real transfer (Stage 6), SMS of the file number (Stage 5), and a voice test of identification (spoken file numbers and dates through real STT).
 
 ### Stage 4: Booking tools
 - **Tools:** `check_availability`, `book_appointment`, `cancel_appointment`, `reschedule_appointment`, `list_my_appointments`.
@@ -438,18 +482,53 @@ Nothing is revealed (name, appointments, anything) until both match.
 ```
 "Have you visited us before?"
    │
-   ├─ No (new) ──────► collect name, DOB, phone ──► duplicate check ──► create ──► give file number
+   ├─ No (new) ──────► collect name, DOB, phone ──► duplicate check (DOB + phone) ──► create ──► give file number
    │
    ├─ Yes, has ID ───► file number ──► verify DOB ──► identified
    │
-   └─ Yes, forgot ID ► name + DOB + phone ──► search ──► exactly 1 match ──► identified + remind ID
+   └─ Yes, forgot ID ► DOB + phone ──► exactly 1 match ──► identified + remind ID
+                                    └► several matches ──► ask name (loose match) ──► 1 match ──► identified
 ```
+
+### Stage 3 decisions (agreed 2026-10-12)
+
+1. **Multi-agent structure** (the user's choice, matching the original Stage 4 plan). Replaces an earlier one-agent recommendation.
+   - **Why:** each agent gets a short prompt and few tools. Long prompts and many tools make a model more likely to skip a rule or pick the wrong tool.
+   - **Security by construction:** `BookingAgent(patient_id)` only exists after verification, and its tools use `self.patient_id`. The LLM has no patient parameter to fill in, so it can't act on another patient.
+   - **Structure:** `ReceptionAgent` (greeting, RAG, identification, routing) → `BookingAgent(patient_id)` (Stage 4) and `RequestsAgent(patient_id)` (Stage 4b).
+   - Every agent's prompt = a shared block (safety, honesty, speech, written once in code) + its own job.
+   - Every agent has `search_knowledge_base`, so small questions mid-booking don't need a handoff.
+   - Handoffs pass `chat_ctx`.
+   - Stage 3 builds `ReceptionAgent`. Its handoff to `BookingAgent` comes in Stage 4.
+2. **Forgot file number: match on date of birth + phone, not the name.**
+   - **The user's point:** speech-to-text spells names unpredictably (Mohammed / Muhammad / Mohamed, Al-Kaabi / Alkaabi), and a patient doesn't know which spelling the clinic stored.
+   - **Security:** a caller with someone's phone and birthday almost certainly has their name too, so the name adds no real protection.
+   - **The name is asked only when DOB + phone returns several files** (e.g. twins on one family phone), and in the registration duplicate check.
+   - **Names are compared by an isolated LLM judge** (`agent/name_judge.py`), decided 2026-10-12, replacing a first hand-written matcher (spelling rules plus a variant list plus `difflib`).
+     - **Why:** the user's call. A hand-written list can't handle Arabic script against English ("أحمد علي" vs "Ahmed Ali"), which Stage 7 needs.
+     - **Isolated:** a separate one-shot call (Groq `openai/gpt-oss-20b`, temperature 0) that returns only a number. The candidate names never reach the conversation agent, so the agent can't leak another patient's name, and the caller can't talk it into revealing them.
+     - **Hardening:** names are cleaned to letters, spaces and hyphens only, and capped at 60 characters, so a caller can't smuggle instructions in. The prompt also tells the judge to treat names as data. A failed or odd answer raises `NameJudgeError`, which means "can't confirm" (never a guess).
+     - **Tests:** unit tests inject a fake judge (deterministic). `tests/test_name_judge.py` runs the real one: English variants, Arabic script, twins, nobody matching, and an injection attempt. **All pass.**
+3. **Lockout across calls:** 5 failed verifications on the same file number within 24 hours locks phone verification for that file until reception unlocks it. Stored in a `verification_attempts` table. This is on top of the 3-attempt limit within one call.
+4. **When the agent can't help, it transfers the call to staff; it never hands out a number to call** (the user's correction, 2026-10-12).
+   - Every fallback now offers `transfer_to_human`: the honesty rule, not in the KB, identification locked, can't confirm by phone, a failed name judge. This replaces Stage 1's temporary redirects to WhatsApp or reception.
+   - The clinic's phone, WhatsApp and email are still knowledge base facts, given **only if the caller asks for them**.
+   - Until Stage 6, the `transfer_to_human` stub says staff can't be connected yet and keeps helping.
+
+**Findings from the conversation tests (fixed in code):**
+- **A tool named in the prompt but not built crashed the agent.** During the emergency test, the model called `transfer_to_human`. Groq rejects calls to tools that weren't sent, the turn failed after 4 retries, and **no reply was produced at all**. This is the "final-stage prompt" risk from Stage 1, and worse than expected.
+  - **Fix:** honest stub tools for everything the prompts name but later stages build (`transfer_to_human` in Stage 6, `log_request` in Stage 4b).
+  - **Rule from now on:** every tool a prompt names must exist, real or stub.
+- **The model registered a patient without reading the details back,** despite the prompt.
+  - **Fix: a two-step registration with a gate in code.** `register_patient` only validates, holds the details as pending, and returns what to read back. `confirm_registration` creates the file, and **refuses unless the caller has spoken since the read-back** (it counts the user messages in the agent's chat history).
+  - The same gate will protect booking, cancelling and rescheduling in Stage 4.
 
 ### Events: new patients
 
 | Event | Handling |
 |---|---|
-| Says "new" but is already registered | Before creating, search name + DOB. If found: "It looks like you may already have a file with us," then switch to the forgot-ID path. Prevents duplicate records. |
+| Says "new" but is already registered | Before creating, search DOB + phone, and compare the name (already collected) loosely. If it's the same person, they're identified via the forgot path. **Never say "you already have a file" to an unverified caller**, because that would confirm to a stranger that someone is a patient here. If DOB + phone match but it's clearly a different person (e.g. a twin), register them. If it's unclear, say registration can't be completed by phone and offer WhatsApp or reception. Never create a duplicate. |
+| Registering a child | The child's details, with the caller's number as `guardian_phone`. |
 | Not sure if they've been before | Treat as forgot-ID: search first, register only if nothing is found. |
 | Hangs up mid-registration | Create the record only at the end, after everything is confirmed. A dropped call leaves nothing half-created. |
 | Name misheard | Ask them to spell it, then read it back. |
@@ -462,15 +541,29 @@ Nothing is revealed (name, appointments, anything) until both match.
 | ID fails the check digit | "I didn't catch that correctly. Could you repeat it slowly?" (likely an STT error) |
 | ID is valid but not found | Ask again once, then offer the forgot-ID path. |
 | ID found, DOB doesn't match | Don't say which one was wrong, since that would confirm the ID exists. Say "Those details don't match our records." |
-| Repeated mismatches | Limit to 3 attempts, then transfer to a human (Stage 6) or ask them to visit. Prevents guessing birth dates. |
+| Repeated mismatches | Limit to 3 attempts per call, enforced **in code**. Then identification is locked for the rest of the call; offer WhatsApp or reception (transfer to a human in Stage 6). Prevents guessing birth dates. General questions still work. |
+| 5 failures on one file number in 24 hours, across calls | Phone verification is locked for that file until reception unlocks it. |
+| Check-digit failure or an impossible date (in the future, or over 120 years ago) | Doesn't count as an attempt (usually a speech-recognition error). Ask again. |
+| Date of birth in any spoken form ("14th of March 1990", "14/3/90") | The LLM passes `YYYY-MM-DD`. **When verifying a returning patient, the agent never repeats the date of birth aloud** (decided 2026-10-12, the user's call), neither before checking nor after a failed check. A misheard date simply fails, and the caller tries again. **Registration is the exception:** the read-back includes the birth date (with the name spelling and the mobile), because there is no stored date yet and a wrong one would break every future verification. |
+| Verified | The tool returns the **first name only**, so the agent can greet them. |
 
 ### Events: forgot their ID
 
 | Event | Handling |
 |---|---|
-| Exactly one match on name + DOB (+ phone) | Identified. Tell them their file number and offer SMS. |
-| Multiple matches (same name and birthday) | Ask for one more detail: phone number or last visit date. |
-| No match | Maybe a different spelling or phone. Offer: spell the name again → register as new → transfer to a human. |
+| Exactly one match on DOB + phone | Identified. Tell them their file number digit by digit, offer to repeat it (SMS in Stage 5). |
+| Several matches on DOB + phone (twins on a family phone) | Ask the name, compare loosely. One match: identified. Otherwise: can't confirm by phone; offer reception. |
+| No match | Don't say whether such a patient exists. Offer to repeat the details, WhatsApp, or reception. |
+| Counts as a failed attempt? | Yes, a no-match counts toward the 3-per-call limit (otherwise this path could be used to guess birthdays). |
+
+### Events: active patient and safety of tools
+
+| Event | Handling |
+|---|---|
+| Switching patients mid-call ("now book for my son too") | The son is fully verified too. One **active patient** at a time; personal tools act only on that one. |
+| Caller asks for personal details before verification, whatever the reason ("I'm the doctor", "it's urgent") | No tool returns anything personal before verification, so there's nothing to leak. |
+| Logs | `patient_id` only, never names, birth dates, or file numbers. |
+| Testing | Unit tests for the tools (attempt counting, lockouts, privacy messages, registration never half-done, loose name matching), plus **text conversation tests** with LiveKit's testing helpers, which run the agent without voice. |
 
 ### Events: who is the patient?
 
@@ -525,7 +618,7 @@ Nothing is revealed (name, appointments, anything) until both match.
 After switching: rewrite `eval/test_set.md` for the new facts and rerun the eval.
 
 ## Open questions
-1. Is date of birth enough for verification, or does the clinic want something else (national ID, last 4 digits of phone)?
+1. Is date of birth enough for verification, or does the clinic want something else (national ID, last 4 digits of phone)? **Strong candidate: the Qatar ID number.** It's 11 digits (reliable over speech-to-text), unique per person, and reception already sees it at the first visit. The trade-offs: it's sensitive to store, and callers often don't have it to hand.
 2. Plan for SMS with the file number in Stage 5? (small per-message Twilio cost)
 3. Spelling Arabic names in English over the phone: is "best effort spelling + DOB match" acceptable for now?
 4. Which vector database for Stage 1b?

@@ -46,8 +46,8 @@ SEARCH_TOOL = {
 
 def agent_prompt() -> str:
     """The live agent's real instructions, so the eval can never drift from agent.py."""
-    from agent import InfoAgent
-    return InfoAgent().instructions
+    from agent import ReceptionAgent
+    return ReceptionAgent().instructions
 
 
 def load_test_set() -> list[dict]:
