@@ -3,7 +3,7 @@ You are writing a fictional knowledge base for a voice AI receptionist at a medi
 
 ## The clinic
 
-- **Name:** Almahmoud Medical Center
+- **Name:** Izghawa Medical Center
 - **Location:** Izghawa, Doha, Qatar
 - **Type:** multi-specialty outpatient clinic (no emergency department, no inpatient beds)
 - **Currency:** QAR
@@ -29,7 +29,7 @@ Invent the details yourself, and keep them **consistent across all files**: the 
 
 ## Format rules (important, the retrieval system depends on them)
 
-- Plain Markdown. The first line of every file is `# <Document title>`, e.g. `# Almahmoud Medical Center Opening Hours`.
+- Plain Markdown. The first line of every file is `# <Document title>`, e.g. `# Izghawa Medical Center Opening Hours`.
 - **One `##` heading per single topic.** A section answers one kind of question. Example: "Parking" and "Directions" are separate sections, not one "Getting here" section. Aim for 4–8 sections per file.
 - **Every section must make sense on its own**, because it will be read without the rest of the file. Repeat names instead of using pronouns that refer to other sections. Never write "as mentioned above" or "see below". Write "Dr. Layla Haddad, the pediatrician, works..." rather than "She works...".
 - **60–150 words per section.** Full sentences in plain prose. Short bullet lists are allowed only for genuine lists (e.g. accepted insurers, fasting tests).
@@ -52,7 +52,7 @@ Do not mention any of these anywhere. They are used to test that the AI admits w
 An evaluation file, in **exactly** this format (the evaluation script parses it):
 
 ```
-# Almahmoud Medical Center Test Set
+# Izghawa Medical Center Test Set
 
 ## Answerable questions
 

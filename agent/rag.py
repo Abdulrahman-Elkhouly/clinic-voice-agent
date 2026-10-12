@@ -15,8 +15,13 @@ def load_chunks() -> list[dict]:
         parts = text.split("\n## ")
         sections = parts[1:] or [text]          # files without ## become one chunk
         for section in sections:
+            heading = section.splitlines()[0].strip() if parts[1:] else doc_title
             # Prefix the doc title so every chunk says what it's about on its own
-            chunks.append({"source": path.name, "text": f"{doc_title}\n## {section.strip()}"})
+            chunks.append({
+                "source": path.name,
+                "id": f"{path.name} > {heading}",   # what the test set's Source lines refer to
+                "text": f"{doc_title}\n## {section.strip()}",
+            })
     return chunks
 
 

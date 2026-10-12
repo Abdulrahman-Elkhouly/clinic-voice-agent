@@ -15,7 +15,7 @@ class CallData:
     kb: KnowledgeBase | None = None   # shared resource, loaded in prewarm
 
 
-CLINIC = "Almahmoud Medical Center"
+CLINIC = "Izghawa Medical Center"
 QATAR_TZ = timezone(timedelta(hours=3))   # Qatar is UTC+3 all year, no daylight saving
 
 SPEECH_RULES = """Your replies are spoken aloud, so:

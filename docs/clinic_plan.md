@@ -12,7 +12,9 @@ The voice agent is moving from the Nova Mobile telecom demo to the **clinic's re
 
 | Topic | Decision |
 |---|---|
-| Clinic | **Almahmoud Medical Center**, Izghawa, Qatar. Multi-specialty. Fictional content for now. |
+| Clinic | **Izghawa Medical Center**, Izghawa, Qatar (renamed from Almahmoud Medical Center on 2026-10-08). Multi-specialty. Fictional content for now. |
+| Arabic knowledge base | **English knowledge base only.** A multilingual embedding model matches Arabic questions to English documents, and the LLM answers in Arabic. One source of truth, no translations to keep in sync. If the Arabic eval fails (especially on names), fall back to Arabic generated from the English KB. A separate hand-written Arabic KB is rejected, because duplicated facts drift apart. |
+| Embedding model | Must be **multilingual** (the user's decision: production level, Arabic support). Chosen by measurement on our own test set, weighing accuracy against CPU latency, since the production server may have no GPU. |
 | Emergency number | 999 (Qatar) |
 | Language | English first. Arabic later. |
 | Scope | One clinic for now. |
@@ -116,7 +118,7 @@ Three sections: answerable (~14), not in the knowledge base (~5), safety (~6). T
   - The model gets the same `search_knowledge_base` tool as on a call and decides whether to search. This is what lets the eval check "no search" on emergencies.
   - **Decision: rule-based checks, not an LLM judge** (predictable, free). The test set has a `**Check:**` line, for example `includes "999"; no search` or `excludes "will cover|is covered"`. Not-in-KB and safety questions are scored automatically; answerable questions are still compared by eye.
   - Safety questions skip retrieval scoring.
-- **Web page:** title and heading changed to Almahmoud Medical Center.
+- **Web page:** title and heading changed to Izghawa Medical Center.
 
 #### What was done (Stage 1)
 - **Domain switched:** Nova Mobile knowledge base deleted (still in git history) and replaced with 8 clinic documents (61 chunks). The test set was rewritten with 25 questions in three sections.
@@ -136,17 +138,208 @@ Three sections: answerable (~14), not in the knowledge base (~5), safety (~6). T
   - Do a voice test: emergencies get 999, the agent never claims to have booked, and questions outside the knowledge base get "I don't have that information."
   - Add `.vscode/settings.json` (`python.analysis.extraPaths: ["agent"]`) so the editor finds the `rag` import.
 
-### Stage 1b: Real vector database
-Replace the in-memory numpy index with a real vector database, then rerun the eval and compare with the in-memory results. Done after Stage 1, so the knowledge base is already validated and any change in scores comes from the database alone.
-- Candidates: **Qdrant** (local/embedded mode now, server later, same API), **Chroma** (simplest), **pgvector** (vectors inside PostgreSQL, if the clinic's real database will be Postgres).
-- *Choice pending.*
+### Stage 1b: Production retrieval (embedding model, then vector database)
+Upgrade retrieval to production level, one problem at a time so every change in scores has one cause: first the embedding model, then the vector database.
+
+**Embedding model**
+- **The current model, `BAAI/bge-small-en-v1.5`, is English only.** Arabic baseline (2026-10-08): hit@1 = **2/10** on the Arabic questions, with every score around 0.58–0.60 (no signal). The two hits are explained by the English word "appointment" in Q31 and by luck. English is still 14/14.
+- **Candidates:** `intfloat/multilingual-e5-small`, `-base`, `-large`, `BAAI/bge-m3` (and possibly `jinaai/jina-embeddings-v3`).
+  - fastembed supports only `multilingual-e5-large` and `jina-v3`. The others need `sentence-transformers` for the comparison.
+  - e5 models need `query:` / `passage:` prefixes.
+- **Metrics:** hit@1 and hit@3 in English and Arabic, CPU search time per query (GPU for reference), and the score gap between answerable and not-in-KB questions.
+- **Rule:** pick the smallest model that isn't clearly worse. Differences of one question are noise.
+- **GPU:** the dev laptop has an RTX 3050 (4 GB), but `onnxruntime` is the CPU build. Using the GPU needs `fastembed-gpu` + CUDA. The model must still be fast enough on a CPU, because the production server may have no GPU.
+- **Only the LLM's search query is embedded,** not every caller turn. Documents are embedded once, at startup.
+- **Network block:** this network blocks `huggingface.co`, so e5 (all sizes) and bge-m3 can't be downloaded here. `bge-small` works only because fastembed fetched it from Qdrant's storage. Fix: download the models once on another network, after which they're cached. Cohere's API is also blocked; OpenAI, Gemini, Jina and Voyage are reachable.
+- **Decision (2026-10-08): try a cloud embedding API in the meantime.** Privacy is not the blocker it first seemed: the call already goes through cloud STT (Deepgram) and a cloud LLM (Groq), and the embedding API sees only the short search query. Provider: **Gemini** `gemini-embedding-001` (free tier). Key in `.env` as `GEMINI_API_KEY`. `compare_embeddings.py` calls its REST API with `httpx` (task type `RETRIEVAL_QUERY` / `RETRIEVAL_DOCUMENT` instead of prefixes).
+
+**Results (2026-10-08, `eval/compare_embeddings.py`)**
+
+| Model | EN hit@1 | AR hit@1 | Time per query | Lowest answerable / highest not-in-KB score |
+|---|---|---|---|---|
+| `bge-small-en` (current, local CPU) | 14/14 | 2/10 | 8 ms | 0.579 / 0.660 |
+| `gemini-embedding-001` (3072 dims, cloud) | 14/14 | **10/10** | **~500 ms** (584 max) | 0.647 / 0.699 |
+| `gemini-embedding-001` (768 dims) | *not run: free tier rate limit (429)* | | | |
+
+- **Gemini solves Arabic,** including the transliterated insurer name, the doctor's name in Arabic, and the mixed-language question.
+- **Latency is the cost:** about 500 ms per search from this network, almost all of it the round trip to Google. The caller hears it on every turn that searches. A production server close to Google's servers would cut this.
+- **Neither model can separate "has an answer" from "has no answer" by score** (the score ranges overlap), so the LLM's judgement is what catches not-in-KB questions. This remains a thing to compare.
+
+**Section-level retrieval scoring (2026-10-08).** The table above scored only the **file**. File-level scoring was a leftover from the Nova Mobile test set, and too loose (8 files, and `doctors_and_specialties.md` alone has 8 similar sections).
+- **Source format:** test set Sources now name the exact section, `file.md > Heading`. Questions that need two facts list both, joined with `+` (Q13: ENT + Friday hours).
+- **Scoring:** hit@1 means the top chunk is one of the needed sections; hit@3 means **all** needed sections are in the top 3.
+- **Chunk ids:** each chunk has an `id` in `rag.py`.
+- **Typo guard:** the eval stops if a Source names a section that doesn't exist.
+- **The English-only model is no longer evaluated** (the user's decision).
+
+| Model | EN hit@1 / @3 | AR hit@1 / @3 | Time per query |
+|---|---|---|---|
+| `gemini-embedding-001` (3072 dims) | 13/14 / 14/14 | 10/10 / 10/10 | 536 ms |
+
+- **The one miss:** "I want a female gynecologist" returns *Choosing a doctor by gender or language* first (it names both female OB/GYNs, but without their schedules). The *Obstetrics and gynecology* section comes second. The agent receives the top 3, so it still gets the schedules. This is a harmless miss, not a retrieval failure.
+- Q13's two-section question passed: both sections were in the top 3.
+- **Status:** Gemini is an **option, not yet chosen.** The user will review its monetary cost and its latency (about 500 ms per search) with their seniors. The live agent still uses `bge-small-en`. Local multilingual models (e5, bge-m3) can be compared once they're downloaded on a network that allows Hugging Face.
+
+**Arabic test set:** 12 questions added to `eval/test_set.md` (10 with a source, 1 not in the KB, 1 emergency), mostly in Gulf dialect, including a doctor's name, a transliterated insurer name, and a mixed Arabic and English question. A new `arabic` check requires the reply to be mostly Arabic. `eval_rag.py` now reads sections by heading and reports retrieval for each section.
+
+**Vector database: Qdrant (decided 2026-10-12).**
+- **Candidates considered:** Qdrant, pgvector, Chroma, Weaviate/Milvus, Pinecone. Scale doesn't decide this (every option handles millions of vectors). What decides it: hybrid search for names, metadata filters, updates without a restart, operational burden, data location, and fit with the patient database.
+- **Why Qdrant:** the clinic's systems are still unknown (so a bet on Postgres can't be verified), hybrid search is built in, and only `rag.py` talks to it, so switching to pgvector later means rewriting one file.
+- **Hosting:** a cloud provider (the user's answer), so Qdrant Cloud or Qdrant on the cloud server in production.
+- **Network:** Docker isn't installed; Qdrant Cloud is reachable.
+
+**Status: paused (2026-10-12), at the user's request, to move on to Stage 2.** Nothing is implemented yet. Before resuming:
+1. **Choose the dev setup.** Qdrant's local folder mode allows only one process at a time, and LiveKit runs each call in its own process. The options:
+   - **A: Qdrant Cloud free cluster** (recommended; same as production)
+   - B: Docker
+   - C: local folder (breaks with concurrent calls)
+
+   Connection settings go in `.env` (`QDRANT_URL`, `QDRANT_API_KEY`), falling back to a local folder.
+2. **Agree on the events below.**
+
+**Events and handling (proposed, not yet agreed):**
+
+| Event | Handling |
+|---|---|
+| First start, empty database | Build the index from the markdown files. |
+| Knowledge base unchanged | Reuse the stored vectors. Each chunk stores a hash of its text, so changes are detected without re-embedding. |
+| Section edited, added, removed, or renamed | Re-embed only what changed, and delete chunks that no longer exist. A stale chunk is the worst failure here. |
+| Duplicate heading within one file | Indexing stops with an error (chunk IDs come from `file > heading`). |
+| Empty or malformed markdown file | Stop with a clear error. |
+| Crash during indexing | Safe to re-run: each chunk has a fixed ID, so upserts just overwrite. |
+| Embedding model changes | One collection per model, named after it. Vectors from different models are never mixed. |
+| Who indexes | A separate command, `agent/index_kb.py`. The agent only checks the index at startup and warns if it's stale, so concurrent call processes never re-index at the same moment. |
+| Database unreachable at startup | The agent refuses to start. |
+| Database unreachable or slow during a call | A timeout of about 2 s. The tool tells the LLM the information is unavailable, and the agent offers WhatsApp. The call never crashes. |
+| Many calls at once | Read-only searches, safe in parallel (needs a server or Qdrant Cloud, not folder mode). |
+| Parity | With the same model, results must be identical to the numpy version. Only then add hybrid search, as a separate measured step. Its keyword model may need Hugging Face, which is blocked here, so check that first. |
+| Interface | `KnowledgeBase.search()` keeps its signature, so the agent and both eval scripts are unchanged. |
+| Security | API key in `.env` only, connections over HTTPS, `qdrant_data/` in `.gitignore`. |
+| Backups | Not needed. The markdown files in git are the source of truth, and the index can be rebuilt. |
+| Data stored | Clinic facts only, no patient data. Qdrant Cloud's region becomes a question for the seniors if patient data is ever stored. |
 
 ### Stage 2: Mock database
 - **SQLite** file, no server to install.
-- **Tables:** `patients`, `doctors`, `slots` (doctor availability), `appointments`.
-- **`db.py`** is the only code that touches SQL. Switching to a real clinic system means rewriting this one file.
+- **`db.py`** is the only code that touches SQL. Switching to a real clinic system means rewriting this one file; its functions are the contract that system must match.
 - **Seed script** with fake doctors, schedules, and patients.
 - **Principle:** policies and how-to text come from RAG. Schedules and appointments (facts that change and must be exact) come from the database.
+- **Scope:** the data layer only. No agent tools yet (identification is Stage 3, booking Stage 4), but the schema is designed now for everything those stages need.
+- **Design page (for review):** https://claude.ai/artifact/EfnJr5yndUvjibgkDJhbXg
+
+#### Design decisions (agreed 2026-10-12)
+1. **Free slots are calculated, not stored.** The plan originally said a `slots` table; replaced by:
+   - **`doctor_schedules`**: the weekly pattern, with `valid_from` / `valid_to`, so hours can change on a set date and Ramadan is its own set of rows. Each row also has a `last_start`, the latest time an appointment may start.
+   - **`schedule_exceptions`**: one-off breaks (leave, public holidays, special hours).
+
+   Free slots = schedule − exceptions − booked and held − the booking window. Storing slot rows would duplicate the schedule and go stale.
+2. **Double booking is prevented by the database:** a unique index on `(doctor_id, start_at)` over rows with status `held` or `booked`. A cancelled slot can be booked again.
+3. **Doctor schedules: the database is the source of truth for booking.** The knowledge base keeps the general description, and a consistency check script reports any difference between the two.
+4. **Holds:**
+   - The agent holds a slot when the caller picks it, before reading it back.
+   - A hold expires after **5 minutes**, and is released immediately when the caller declines or hangs up.
+   - Only one hold per call at a time.
+   - A hold is an `appointments` row with status `held`, so the same unique index guards holds and bookings.
+5. **Concurrency:**
+   - SQLite allows one write at a time. Each write takes about 1 ms, so writes for *different* slots queue briefly and all succeed.
+   - Only the *same* slot competes. Whichever write reaches the database first wins, and the other gets "slot taken" and is offered the next free slot.
+   - Reads are never blocked (WAL mode).
+   - PostgreSQL would lock only the affected rows.
+
+**Tables:**
+- `doctors`
+- `doctor_schedules`
+- `schedule_exceptions`
+- `patients` (`patient_id`, `file_number` with a Luhn check digit, name, DOB, phone, optional guardian phone, `id_verified`)
+- `appointments` (status `held` / `booked` / `cancelled` / `completed` / `no_show` / `released` / `expired`, `hold_expires_at`, `channel`, `late_change`)
+- `waitlist`
+
+#### Events: scheduling and availability
+| Event | Handling |
+|---|---|
+| Time outside the doctor's hours | No slot exists; offer the nearest real ones. |
+| Clinic closed (Friday morning, public holiday) | Exception rows; no slots. |
+| Ramadan | A separate set of dated schedule rows. |
+| Doctor on leave or sick | Exception for that doctor. Existing appointments on those days get flagged for staff (Stage 4c). |
+| Last appointment | Starts by 21:30, 30 min before closing (each schedule row's `last_start`). |
+| Booking in the past or too soon | Rejected. Minimum notice is 30 min. |
+| Booking too far ahead | Rejected. Horizon is 60 days. |
+| Slot length | Set per doctor schedule. |
+| Walk-ins | Not in the database (out of scope). |
+
+#### Events: booking integrity
+| Event | Handling |
+|---|---|
+| Two callers grab the same slot | The unique index lets one win; the other gets "slot taken". |
+| Caller picks a slot and then hesitates | The slot is held (see above). |
+| Same patient, overlapping appointments with different doctors | Rejected. |
+| Reschedule | One transaction. If the new slot fails, the old appointment stays. |
+| Cancel or reschedule within 4 hours (still in the future) | Allowed, marked `late_change`. |
+| **Cancel or reschedule an appointment that has started or is in the past** (added by the user) | Rejected by `db.py`. The agent offers a new booking instead. |
+| Appointment already `completed` or `no_show` | Can't be cancelled or rescheduled; only staff can change these (Stage 4c). |
+| No-show | Status `no_show`, set by staff. Three in six months means paying in advance, so the database counts them per patient. |
+| Waitlist | Table ready now; used in Stage 4. |
+| History | Never deleted, only status changes. `channel` records who booked (phone agent, WhatsApp, reception). |
+
+#### Events: patients and technical
+| Event or requirement | Handling |
+|---|---|
+| Minors | Store the DOB; guardian phone is optional. |
+| Shared phone numbers | Allowed (the phone isn't unique). |
+| Registered by phone, ID not yet seen | `id_verified` flag, set by reception at the first visit. |
+| Several call processes write at once | SQLite in WAL mode with a busy timeout. |
+| Agent stays responsive | `db.py` calls run in a thread (`asyncio.to_thread`). |
+| Times | Stored as ISO 8601 with `+03:00`. |
+| Privacy | Fake patients only. `*.db` is in `.gitignore`. No names in logs. |
+| Tests | Automated tests for `db.py`, including a double-booking race between two processes and a reschedule that fails halfway. |
+
+**Fictional settings (added to the switch checklist):** minimum notice 30 min, horizon 60 days, hold expiry 5 min, slot lengths per specialty.
+
+#### What was done (Stage 2)
+- **`agent/db.py`:** the data layer, and the only code that runs SQL. `ClinicDB` exposes:
+  - doctors (list and filter by specialty, gender, or language)
+  - `free_slots` (calculated: schedule − exceptions − booked and held − window)
+  - patients: `create_patient` (file number with a Luhn check digit), `find_by_file_number`, `verify_patient` (file number **and** DOB), `find_by_details`
+  - holds: `hold_slot`, `confirm_hold`, `release_hold` (per hold, or every hold of a call on hang-up)
+  - `book_slot` for staff channels, `cancel_appointment`, `reschedule` (moves to a held slot in one transaction), `list_appointments`
+  - staff `mark_outcome`, `count_no_shows`, `add_to_waitlist`
+
+  Errors are typed (`SlotTaken`, `SlotUnavailable`, `PatientBusy`, `HoldExpired`, `NotAllowed`, `NotFound`), and each message is safe to hand to the LLM as a tool result.
+- **`agent/seed_db.py`:** builds `data/clinic.db` with:
+  - the 12 doctors and their weekly schedules from the knowledge base, with slot lengths per specialty and `last_start` 21:30 on schedules ending at 22:00
+  - Qatar National Day closures
+  - a day of leave for Dr. Benali
+  - 7 fake patients: a father and son sharing a phone number, and two "Ahmed Ali"s with the same birthday for Stage 3's multiple-match path
+  - 6 appointments placed relative to today (4 upcoming; 1 completed and 1 no-show in the past)
+
+  `random.seed(42)` keeps file numbers stable across rebuilds. It refuses to overwrite without `--reset`.
+- **`agent/check_schedules.py`:** parses `doctors_and_specialties.md` (names, genders, languages, day phrases like "Saturday to Wednesday", times like "3:00 in the afternoon") and compares it with the database. Exit code 1 on any difference. Result: **all 12 doctors agree.**
+- **`tests/test_db.py`:** 31 tests, all passing, with a fixed "now" (Monday 12 Oct 2026, 09:00). They cover:
+  - check-digit errors
+  - the slot grid, `last_start`, leave and closures, special hours, dated schedule changes, the notice and horizon window
+  - holds blocking others, hold expiry, release on hang-up, one hold per call
+  - off-grid and out-of-hours times, naive datetimes, patient overlap
+  - no cancelling past, started, or completed appointments; no touching another patient's appointment; late changes; re-booking a cancelled slot
+  - reschedule success, and **a failed reschedule keeping the old appointment**
+  - **two processes holding the same slot at the same instant (exactly one wins, 5 rounds)**
+  - the consistency check catching a difference
+- **Ideas used:**
+  - computed availability instead of stored slots
+  - a partial unique index as the double-booking guard (covering holds too)
+  - `BEGIN IMMEDIATE` so checks and inserts can't interleave with another writer
+  - a short-lived connection per call (safe across threads and processes)
+  - injectable `now` for deterministic tests
+  - status changes instead of deletes
+  - a `patient_id` check in every change, so one patient can't touch another's appointment whatever the caller says
+- **Tools:** SQLite (WAL mode, busy timeout, foreign keys), pytest (added to `requirements.txt`), `multiprocessing` (spawn) for the race test.
+- **`.gitignore`:** now also ignores SQLite's `*.db-wal` / `*.db-shm` side files (they hold recent writes, so they could contain patient data), `data/`, and `.pytest_cache/`.
+- **Not in `requirements.txt`:** `sentence-transformers` / `torch`, installed only for comparing embedding models in Stage 1b.
+- **Run:**
+
+  ```
+  python agent\seed_db.py --reset
+  python agent\check_schedules.py
+  python -m pytest tests -v
+  ```
 
 ### Stage 3: Patient identification
 See the full design below.
@@ -185,7 +378,7 @@ Without it, bookings and requests go into a database nobody reads.
 
 ### Stage 5: Real phone calls (Twilio)
 - **Path:** Twilio phone number → SIP trunk → LiveKit SIP → room → agent. A phone caller is just another participant in the room.
-- **Caller ID** arrives as a participant attribute and can suggest a patient match. Date of birth is still verified, since numbers are shared and can be spoofed.
+- **Caller ID** arrives as a participant attribute and can suggest a patient match. Date of birth is still verified, since numbers are shared and can be spoofed. 
 - **SMS** to send new patients their file number.
 - **Expect:** lower audio quality (8 kHz) and more STT errors, a small monthly cost per number, and the ICENTER network block.
 - *Events table to be written before implementation.*
@@ -306,7 +499,7 @@ Nothing is revealed (name, appointments, anything) until both match.
 
 | Assumption (fictional now) | Ask the clinic | Where it lives |
 |---|---|---|
-| Name: Almahmoud Medical Center | Real name | `CLINIC` in `agent.py`, the prompt intro, the web page title and heading, the knowledge base |
+| Name: Izghawa Medical Center | Real name | `CLINIC` in `agent.py`, the prompt intro, the web page title and heading, the knowledge base |
 | Location: Izghawa, Qatar | Address, country | Prompt intro in `agent.py`, `about_the_clinic.md` |
 | Time zone UTC+3 | Time zone | `QATAR_TZ` in `agent.py` |
 | Emergency number 999 | Local emergency number | `SAFETY_RULES` in `agent.py`, eval safety section |
@@ -323,6 +516,9 @@ Nothing is revealed (name, appointments, anything) until both match.
 | Topics left out (dental, MRI/CT, ...) | What they actually offer | Decisions table, "not in KB" eval questions |
 | Languages: English, then Arabic | Which languages callers use | `LANGUAGE_RULES`, Stage 7 |
 | Mock SQLite database | Their real system (and API) | `db.py` |
+| Booking rules: minimum notice 30 min, horizon 60 days, hold expiry 5 min | Their real booking rules | Settings at the top of `db.py` |
+| Slot length per specialty (15 / 20 / 30 min) | Real appointment lengths per doctor | `seed_db.py` → `doctor_schedules` |
+| Schedules, leave, holidays in the mock database | Their real rota | `seed_db.py` (later, their system) |
 | Transfer target | Who calls get transferred to, and their hours | `transfer_to_human` (Stage 6) |
 | Privacy law: Qatar PDPPL | Local law, recording consent | "Throughout every stage" |
 

@@ -1,4 +1,4 @@
-"""Evaluate the agent's RAG and safety behaviour against eval/test_set.md, without voice.
+r"""Evaluate the agent's RAG and safety behaviour against eval/test_set.md, without voice.
 
     python eval\eval_rag.py          # retrieval only (offline)
     python eval\eval_rag.py --llm    # retrieval + Groq answers + checks
@@ -16,7 +16,15 @@ sys.path.insert(0, str(ROOT / "agent"))
 from rag import KnowledgeBase  # noqa: E402
 
 K = 3
-SECTIONS = ("answerable", "not_in_kb", "safety")
+# Test set heading -> section kind
+SECTIONS = {
+    "Answerable questions": "answerable",
+    "Questions outside the knowledge base": "not_in_kb",
+    "Safety questions": "safety",
+    "Arabic questions": "arabic",
+}
+ARABIC_LETTERS = re.compile(r"[؀-ۿ]")
+LATIN_LETTERS = re.compile(r"[A-Za-z]")
 
 # Same tool the live agent has, in OpenAI function-calling format.
 # The model decides whether to search, exactly as on a call.
@@ -44,30 +52,51 @@ def agent_prompt() -> str:
 
 def load_test_set() -> list[dict]:
     text = (ROOT / "eval" / "test_set.md").read_text(encoding="utf-8")
-    parts = re.split(r"^## (?:Questions outside the knowledge base|Safety questions)\s*$", text, flags=re.M)
     tests = []
-    for section, kind in zip(parts, SECTIONS):
+    for section in re.split(r"^(?=## )", text, flags=re.M):
+        kind = SECTIONS.get(section.splitlines()[0].removeprefix("## ").strip())
+        if not kind:
+            continue
         for block in re.split(r"\n(?=\d+\. )", section):
             q = re.search(r"\*\*Question:\*\*\s*(.+?)\s*$", block, re.M)
             if not q:
                 continue
             expected = re.search(r"\*\*(?:Correct answer|Expected response):\*\*\s*(.+?)\s*$", block, re.M)
-            source = re.search(r"\*\*Source:\*\*\s*`(.+?)`", block)
+            source = re.search(r"\*\*Source:\*\*\s*(.+?)\s*$", block, re.M)
             check = re.search(r"\*\*Check:\*\*\s*(.+?)\s*$", block, re.M)
             tests.append({
                 "question": q.group(1),
                 "expected": expected.group(1) if expected else "",
-                "source": source.group(1) if source else None,
+                # Chunk ids ("file.md > Heading"); several when the answer needs more than one section
+                "sources": re.findall(r"`(.+?)`", source.group(1)) if source else [],
                 "check": check.group(1) if check else "",
                 "kind": kind,
             })
     return tests
 
 
+def check_sources(tests: list[dict], chunks: list[dict]):
+    """Stop on a Source that names no real chunk, so a typo can't pass as a retrieval miss."""
+    ids = {c["id"] for c in chunks}
+    bad = [s for t in tests for s in t["sources"] if s not in ids]
+    if bad:
+        sys.exit(f"Unknown Source sections in test_set.md: {bad}")
+
+
+def score_retrieval(sources: list[str], top_ids: list[str]) -> tuple[bool, bool]:
+    """hit@1: the top chunk is one of the needed sections. hit@k: every needed section is in the top k."""
+    return top_ids[0] in sources, all(s in top_ids for s in sources)
+
+
 def run_checks(check: str, reply: str, searched: bool) -> list[str]:
-    """Check line format: includes "a|b"; excludes "c|d"; no search. Returns the failures."""
+    """Check line format: includes "a|b"; excludes "c|d"; no search; arabic. Returns the failures."""
     failures = []
     for rule in filter(None, (r.strip() for r in check.split(";"))):
+        if rule == "arabic":
+            # Mostly Arabic letters; English names and "QAR" inside an Arabic reply are fine
+            if len(ARABIC_LETTERS.findall(reply)) <= len(LATIN_LETTERS.findall(reply)):
+                failures.append("reply is not in Arabic")
+            continue
         if rule == "no search":
             if searched:
                 failures.append("searched the knowledge base")
@@ -137,23 +166,27 @@ def main():
         return
 
     tests = load_test_set()
-    hit1 = hitk = answerable = 0
-    passed = {kind: 0 for kind in SECTIONS}
-    checked = {kind: 0 for kind in SECTIONS}
+    check_sources(tests, kb.chunks)
+    kinds = SECTIONS.values()
+    hit1, hitk, scored = ({kind: 0 for kind in kinds} for _ in range(3))
+    passed = {kind: 0 for kind in kinds}
+    checked = {kind: 0 for kind in kinds}
 
     for i, t in enumerate(tests, 1):
         print(f"\nQ{i} [{t['kind']}]: {t['question']}")
 
-        if t["kind"] != "safety":   # retrieval is meaningless for safety questions
+        # Retrieval is scored for questions with a known source; skipped for safety
+        if t["kind"] != "safety" and (t["sources"] or t["kind"] == "not_in_kb"):
             results = kb.search(t["question"], K)
-            sources = [c["source"] for _, c in results]
+            top_ids = [c["id"] for _, c in results]
             for rank, (score, chunk) in enumerate(results, 1):
-                mark = " <-- expected" if chunk["source"] == t["source"] else ""
-                print(f"   {rank}. {score:.3f}  {chunk['source']}{mark}")
-            if t["kind"] == "answerable":
-                answerable += 1
-                hit1 += sources[0] == t["source"]
-                hitk += t["source"] in sources
+                mark = " <-- expected" if chunk["id"] in t["sources"] else ""
+                print(f"   {rank}. {score:.3f}  {chunk['id']}{mark}")
+            if t["sources"]:
+                h1, hk = score_retrieval(t["sources"], top_ids)
+                scored[t["kind"]] += 1
+                hit1[t["kind"]] += h1
+                hitk[t["kind"]] += hk
             else:
                 print("   (not in KB: top score should be low)")
 
@@ -171,9 +204,12 @@ def main():
                     passed[t["kind"]] += 1
                     print("   PASS")
 
-    print(f"\nRetrieval: hit@1 = {hit1}/{answerable}, hit@{K} = {hitk}/{answerable}")
+    print()
+    for kind in kinds:
+        if scored[kind]:
+            print(f"Retrieval [{kind}]: hit@1 = {hit1[kind]}/{scored[kind]}, hit@{K} = {hitk[kind]}/{scored[kind]}")
     if client:
-        for kind in SECTIONS:
+        for kind in kinds:
             if checked[kind]:
                 print(f"Checks [{kind}]: {passed[kind]}/{checked[kind]} passed")
         print("Answerable questions have no automatic check: compare AGENT with EXPECTED by eye.")
