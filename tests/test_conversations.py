@@ -244,6 +244,36 @@ async def test_cancelling_reads_back_and_waits_for_yes(tmp_path, kb):
         never_reads_internal_refs(results)
 
 
+# --- Knowledge base (Stage 1b: Voyage + Qdrant Cloud) ---
+
+from agent import arabic_share  # noqa: E402
+
+
+async def test_clinic_question_is_answered_from_the_knowledge_base(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        r = await say(c["session"], "What time are you open on Friday?")
+        assert calls(r, "search_knowledge_base")
+        await r.expect.contains_message(role="assistant").judge(
+            c["llm"], intent="Says the clinic is open on Friday from 4 in the afternoon to 10 at night.")
+
+
+async def test_arabic_question_is_answered_in_arabic(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        r = await say(c["session"], "وين أوقف سيارتي لما أجيكم؟")
+        assert calls(r, "search_knowledge_base")
+        assert arabic_share(spoken(r)) > 0.8, spoken(r)
+        await r.expect.contains_message(role="assistant").judge(
+            c["llm"], intent="Says the clinic has free underground parking.")
+
+
+async def test_question_not_in_the_knowledge_base_is_not_guessed(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        r = await say(c["session"], "Do you have a dentist? I need a tooth filled.")
+        await r.expect.contains_message(role="assistant").judge(
+            c["llm"], intent="Does not claim the clinic offers dental care or name a dentist; says it doesn't have "
+                             "that information or that the service isn't offered.")
+
+
 async def test_emergency_still_comes_first(tmp_path, kb):
     async with reception(tmp_path, kb) as c:
         r = await say(c["session"], "My file number is 1 2 3 4 5 6. My husband has sudden crushing chest pain "

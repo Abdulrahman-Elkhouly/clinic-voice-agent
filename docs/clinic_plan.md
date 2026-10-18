@@ -26,7 +26,8 @@ The voice agent is moving from the Nova Mobile telecom demo to the **clinic's re
 | Booking channels | The agent is **one** booking channel; the clinic also takes bookings through its other channels. The knowledge base describes all of them. All channels share one database, so double booking must be prevented by the database itself. |
 | Name + phone intake (`IntakeAgent`) | Removed in Stage 1. Replaced by proper identification in Stage 3. |
 | Knowledge base content | Written by Claude, reviewed by the user. (A first attempt by another AI from [kb_generation_prompt.md](kb_generation_prompt.md) was rejected.) The knowledge base holds clinic **facts**; how the agent behaves lives in its prompts. |
-| Vector database | Move from the in-memory index to a real vector DB. Choice pending (see Stage 1b). |
+| Vector database | **Qdrant Cloud** (hosted by Qdrant, not run locally), chosen 2026-10-18. Free cluster for development (see Stage 1b). |
+| Embedding API | **Voyage `voyage-4`** (1024 dims), chosen 2026-10-18 after the cloud API comparison in Stage 1b: perfect in English and Arabic, fastest, best score gap. Qwen via DeepInfra not needed for now. Key in `.env` as `VOYAGE_API_KEY`. |
 | Booking channels (list) | Phone (the agent, 24/7), WhatsApp (staff, during opening hours), walk-in at reception. |
 | Opening hours | Sat–Thu 8:00–22:00, Friday 16:00–22:00, shorter split hours in Ramadan. |
 | Clinic content | All doctors, prices, and insurers are invented (fictional names). Each doctor's gender is stated, since patients often ask for a female doctor. |
@@ -181,7 +182,33 @@ Upgrade retrieval to production level, one problem at a time so every change in 
 
 - **The one miss:** "I want a female gynecologist" returns *Choosing a doctor by gender or language* first (it names both female OB/GYNs, but without their schedules). The *Obstetrics and gynecology* section comes second. The agent receives the top 3, so it still gets the schedules. This is a harmless miss, not a retrieval failure.
 - Q13's two-section question passed: both sections were in the top 3.
-- **Status:** Gemini is an **option, not yet chosen.** The user will review its monetary cost and its latency (about 500 ms per search) with their seniors. The live agent still uses `bge-small-en`. Local multilingual models (e5, bge-m3) can be compared once they're downloaded on a network that allows Hugging Face.
+- **Status (superseded 2026-10-18: Voyage `voyage-4` chosen, see below):** Gemini is an **option, not yet chosen.** The user will review its monetary cost and its latency (about 500 ms per search) with their seniors. The live agent still uses `bge-small-en`. Local multilingual models (e5, bge-m3) can be compared once they're downloaded on a network that allows Hugging Face.
+
+**Cloud API comparison (2026-10-18).** The user narrowed the choice to an embedding API: Gemini or Qwen, then Voyage
+was added. All are almost free at our scale (a search is about 20 tokens), so cost doesn't decide it.
+- **Prices per million tokens:** Gemini $0.15; Qwen3-Embedding-8B $0.01 (DeepInfra, Nebius; OpenRouter passes the
+  same provider prices through); Voyage `voyage-4` $0.06, `voyage-4-large` $0.12, `voyage-4-lite` $0.02, with 200M
+  free tokens per model.
+- **Qwen not run yet:** DeepInfra needs a positive balance (402). OpenRouter's free embedding models don't include Qwen.
+  `compare_embeddings.py` has `qwen-8b`, `qwen-4b`, `qwen-0.6b` ready (with Qwen's query instruction).
+- **Voyage's 4-series share one vector space**, so `voyage-large+lite` embeds the knowledge base with the large model
+  and searches with the lite one.
+
+| Model (API) | EN hit@1 / @3 | AR hit@1 / @3 | Median / max per query | Score gap | Lowest answerable / highest not-in-KB |
+|---|---|---|---|---|---|
+| `voyage-4-large` | 14/14 / 14/14 | 10/10 / 10/10 | 392 / 977 ms | 0.154 | 0.396 / 0.498 |
+| **`voyage-4`** | **14/14 / 14/14** | **10/10 / 10/10** | **358 / 394 ms** | **0.152** | 0.345 / 0.481 |
+| `voyage-4-lite` | 13/14 / 14/14 | 8/10 / 10/10 | 369 / 928 ms | 0.110 | 0.319 / 0.489 |
+| `voyage-4-large` docs + `lite` queries | 14/14 / 14/14 | 8/10 / 10/10 | 388 / 472 ms | 0.109 | 0.312 / 0.477 |
+| `gemini-embedding-001` (3072) | 13/14 / 14/14 | 10/10 / 10/10 | 470 / 918 ms | 0.078 | 0.647 / 0.699 |
+| `gemini-embedding-001` (768) | *429 again on the free tier* | | | | |
+
+- **`voyage-4` is the best result so far:** perfect in both languages, the fastest and steadiest, and twice Gemini's
+  score gap (answerable and not-in-KB questions are easier to tell apart).
+- `voyage-4-large` adds nothing over `voyage-4` here, and the large+lite combination loses two Arabic questions.
+- **No model separates the two cleanly:** for each one, some not-in-KB question scores higher than the lowest
+  answerable one. So "I don't have that information" must stay the LLM's job, not a score threshold.
+- Latency is one run from this network; the max values are single spikes.
 
 **Arabic test set:** 12 questions added to `eval/test_set.md` (10 with a source, 1 not in the KB, 1 emergency), mostly in Gulf dialect, including a doctor's name, a transliterated insurer name, and a mixed Arabic and English question. A new `arabic` check requires the reply to be mostly Arabic. `eval_rag.py` now reads sections by heading and reports retrieval for each section.
 
@@ -191,35 +218,66 @@ Upgrade retrieval to production level, one problem at a time so every change in 
 - **Hosting:** a cloud provider (the user's answer), so Qdrant Cloud or Qdrant on the cloud server in production.
 - **Network:** Docker isn't installed; Qdrant Cloud is reachable.
 
-**Status: paused (2026-10-12), at the user's request, to move on to Stage 2.** Nothing is implemented yet. Before resuming:
-1. **Choose the dev setup.** Qdrant's local folder mode allows only one process at a time, and LiveKit runs each call in its own process. The options:
-   - **A: Qdrant Cloud free cluster** (recommended; same as production)
-   - B: Docker
-   - C: local folder (breaks with concurrent calls)
+**Resumed 2026-10-18.** Embeddings: Voyage `voyage-4` (see the cloud API comparison above). Dev setup: **Qdrant Cloud
+free cluster** (AWS `eu-central-1`, Frankfurt), the user's choice; `QDRANT_URL` and `QDRANT_API_KEY` in `.env`.
+Round trip from this network: about 130 to 165 ms.
 
-   Connection settings go in `.env` (`QDRANT_URL`, `QDRANT_API_KEY`), falling back to a local folder.
-2. **Agree on the events below.**
-
-**Events and handling (proposed, not yet agreed):**
+**Events and handling (agreed 2026-10-18):**
 
 | Event | Handling |
 |---|---|
-| First start, empty database | Build the index from the markdown files. |
-| Knowledge base unchanged | Reuse the stored vectors. Each chunk stores a hash of its text, so changes are detected without re-embedding. |
-| Section edited, added, removed, or renamed | Re-embed only what changed, and delete chunks that no longer exist. A stale chunk is the worst failure here. |
-| Duplicate heading within one file | Indexing stops with an error (chunk IDs come from `file > heading`). |
-| Empty or malformed markdown file | Stop with a clear error. |
-| Crash during indexing | Safe to re-run: each chunk has a fixed ID, so upserts just overwrite. |
-| Embedding model changes | One collection per model, named after it. Vectors from different models are never mixed. |
-| Who indexes | A separate command, `agent/index_kb.py`. The agent only checks the index at startup and warns if it's stale, so concurrent call processes never re-index at the same moment. |
-| Database unreachable at startup | The agent refuses to start. |
-| Database unreachable or slow during a call | A timeout of about 2 s. The tool tells the LLM the information is unavailable, and the agent offers WhatsApp. The call never crashes. |
-| Many calls at once | Read-only searches, safe in parallel (needs a server or Qdrant Cloud, not folder mode). |
-| Parity | With the same model, results must be identical to the numpy version. Only then add hybrid search, as a separate measured step. Its keyword model may need Hugging Face, which is blocked here, so check that first. |
-| Interface | `KnowledgeBase.search()` keeps its signature, so the agent and both eval scripts are unchanged. |
-| Security | API key in `.env` only, connections over HTTPS, `qdrant_data/` in `.gitignore`. |
-| Backups | Not needed. The markdown files in git are the source of truth, and the index can be rebuilt. |
-| Data stored | Clinic facts only, no patient data. Qdrant Cloud's region becomes a question for the seniors if patient data is ever stored. |
+| First run, empty cluster | `index_kb.py` builds the collection from the markdown files. |
+| Knowledge base unchanged | Re-running embeds nothing: each section stores a hash of its text. |
+| Section edited, added, removed, or renamed | Only changed sections are re-embedded; sections that no longer exist are deleted. A stale section is the worst failure here. |
+| Duplicate heading within one file, or an empty file | Indexing stops with a clear error (ids come from `file > heading`). |
+| Crash during indexing | Safe to re-run: each section has a fixed id (UUID5 of `file > heading`), so upserts overwrite. |
+| Embedding model changes | One collection per model, named after it (`kb_voyage-4_1024`). Vectors from different models never mix. |
+| Who indexes | Only `agent/index_kb.py`. Each call runs in its own process, so the agent only checks the index at startup. |
+| Cluster missing or unreachable at startup (the free cluster is suspended after a week unused, deleted after four) | The agent refuses to start, with the fix in the message (reactivate the cluster, or run `index_kb.py`). |
+| Index out of date at startup | Start, with a warning to run `index_kb.py`. |
+| Voyage or Qdrant down or slow during a call | 2 s timeout per call (4 s for the whole search). The tool tells the LLM the information can't be looked up, and the agent offers `transfer_to_human`. The call never crashes. |
+| Voyage rate limit (429) during a call | Same as down. Before going live, make sure the Voyage account has a card on file (higher limits; the free tokens still apply). |
+| Many calls at once | Searches are read-only, safe in parallel. |
+| Parity | `eval_rag.py` must reproduce the comparison: 14/14 English, 10/10 Arabic. |
+| Hybrid search (keywords + vectors, for names) | A separate, measured step later. |
+| Interface | `KnowledgeBase.search()` and `kb.chunks` keep their shape, so the agent and the eval scripts are unchanged. |
+| Security | Keys in `.env` only, HTTPS. Clinic facts only, no patient data. |
+| Backups | Not needed: the markdown files in git are the source of truth, and the index can be rebuilt. |
+| Deployment | Run the agent's server in the same region as the Qdrant cluster (AWS Frankfurt), so the Qdrant round trip becomes a few ms. |
+
+#### What was done (Stage 1b)
+- **`agent/rag.py`** rewritten: Voyage `voyage-4` embeddings (called with `httpx`, `input_type` query or document)
+  and Qdrant Cloud storage and search.
+  - `load_chunks` now stops on an empty file or a duplicate heading.
+  - `sync_index` embeds only new or changed sections (text hash) and deletes removed ones.
+  - `KnowledgeBase` checks the collection at startup (refuses to start if it's missing, warns if it's stale) and
+    raises `KnowledgeBaseUnavailable` on any Voyage or Qdrant failure. The client and embedder can be injected,
+    for offline tests.
+- **`agent/index_kb.py`** (new): the only command that writes the index. First run: 61 embedded; second run: 0.
+- **`agent/agent.py`:** `search_knowledge_base` runs the search with a 4 s deadline; on failure it returns `KB_DOWN`
+  (say it can't be checked now, don't guess, offer a transfer).
+- **`requirements.txt`:** `qdrant-client` and its dependencies (`pywin32` only on Windows). The agent no longer uses
+  the local `bge-small` model (`fastembed` stays for `compare_embeddings.py`).
+- **`eval/compare_embeddings.py`:** Qwen (DeepInfra) and Voyage options added.
+- **Results:**
+  - `eval_rag.py` on the live setup: **English 14/14 (hit@1 and hit@3), Arabic 10/10 (hit@1 and hit@3)**,
+    the same as the comparison.
+  - End-to-end search from this network: **about 550 ms median** (Voyage about 360 ms plus Qdrant about 135 ms),
+    one spike of 1.1 s in 10 searches.
+- **Tests:** `tests/test_rag.py` (11, offline: Qdrant in memory, fake embedder): chunking checks, incremental sync
+  (edit, remove, rename leave nothing stale), startup checks, search, failures, and the tool's fallback.
+  All unit tests: 130 passed.
+- **New conversation tests** (no existing one made the agent search): an English question answered from the knowledge
+  base (Friday hours), an Arabic question answered in Arabic (parking), and a question not in the knowledge base
+  (dentist) that isn't guessed. Run with the emergency and booking tests: all pass.
+- **Finding: Arabic questions were sometimes answered in English.** Retrieval and facts were right, but everything
+  else the model sees (instructions, its greeting, knowledge base text) is English. A stronger prompt rule ("translate
+  into Arabic") got 3 of 4 runs right, which isn't reliable.
+  - **Fix in code:** `ClinicAgent.llm_node` (the base of both agents) runs before every LLM call, including the one
+    after a tool result. When the caller's last message is mostly Arabic letters, it adds "Write your reply in
+    Arabic" as the last message, on a copy, so it's never stored. Result: 4 of 4 runs in Arabic; English unaffected.
+  - The prompt rule stays too ("reply in the language of the caller's last message ... translate into Arabic").
+- **Not yet:** hybrid search; a paid Qdrant cluster and the Voyage card for production; a voice test of searches.
 
 ### Stage 2: Mock database
 - **SQLite** file, no server to install.

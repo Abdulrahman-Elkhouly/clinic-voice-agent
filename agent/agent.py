@@ -13,9 +13,14 @@ from booking import BookingState
 from db import ClinicDB, now_qatar
 from identity import CallIdentity
 from prompts import CLINIC, booking_instructions, reception_instructions
-from rag import KnowledgeBase
+from rag import SEARCH_TIMEOUT, KnowledgeBase, KnowledgeBaseUnavailable
 
 load_dotenv()
+
+# Two network calls per search (Voyage, then Qdrant), each with its own SEARCH_TIMEOUT; this caps the whole search
+SEARCH_DEADLINE = 2 * SEARCH_TIMEOUT
+KB_DOWN = ("The clinic information can't be looked up right now. Tell the caller you can't check that at the moment, "
+           "don't guess, and offer to transfer them to a member of staff.")
 
 
 # The call's "file": one instance per call, shared by every tool and every agent of the call
@@ -42,8 +47,13 @@ async def search_knowledge_base(context: RunContext[CallData], query: str) -> st
     Args:
         query: A short, specific query, e.g. "female dermatologist days".
     """
-    # search() is CPU work; run it in a thread so audio doesn't stutter
-    results = await asyncio.to_thread(context.userdata.kb.search, query, 3)
+    # search() is blocking network I/O (Voyage, then Qdrant); run it in a thread so audio doesn't stutter
+    try:
+        results = await asyncio.wait_for(asyncio.to_thread(context.userdata.kb.search, query, 3),
+                                         SEARCH_DEADLINE)
+    except (KnowledgeBaseUnavailable, asyncio.TimeoutError) as e:
+        print(f"[RAG] search failed: {type(e).__name__}")
+        return KB_DOWN
     print(f"[RAG] query: {query}")
     for score, chunk in results:
         print(f"[RAG]   {score:.3f}  {chunk['id']}")
@@ -83,6 +93,33 @@ async def log_request(context: RunContext[CallData], request_type: str, details:
 
 SHARED_TOOLS = [search_knowledge_base, transfer_to_human, log_request]
 
+# The prompt says to reply in the caller's language, but everything else the model sees (instructions, its greeting,
+# knowledge base results) is English, and in tests it sometimes answered Arabic questions in English.
+ARABIC_REPLY = "The caller is speaking Arabic. Write your reply in Arabic."
+
+
+def arabic_share(text: str) -> float:
+    """Share of letters that are Arabic script (names and insurers may be in English inside an Arabic sentence)."""
+    letters = [ch for ch in text if ch.isalpha()]
+    return sum("؀" <= ch <= "ۿ" for ch in letters) / max(1, len(letters))
+
+
+def caller_speaks_arabic(chat_ctx) -> bool:
+    last = next((item for item in reversed(chat_ctx.items) if getattr(item, "role", None) == "user"), None)
+    return last is not None and arabic_share(last.text_content or "") > 0.5
+
+
+class ClinicAgent(Agent):
+    """Base for every agent of the call."""
+
+    def llm_node(self, chat_ctx, tools, model_settings):
+        # Runs before every LLM call, including the one after a tool result. The reminder goes last, on a copy,
+        # so it applies to this reply only and is never stored in the conversation.
+        if caller_speaks_arabic(chat_ctx):
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(role="system", content=ARABIC_REPLY)
+        return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+
 
 def handoff_ctx(agent: Agent):
     """The conversation for the next agent: what was said, without the previous agent's tool calls and results
@@ -90,7 +127,7 @@ def handoff_ctx(agent: Agent):
     return agent.chat_ctx.copy(exclude_function_call=True)
 
 
-class ReceptionAgent(Agent):
+class ReceptionAgent(ClinicAgent):
     """Greets callers, answers general questions, and identifies patients.
     Personal work (booking, requests) happens in agents created only after verification."""
 
@@ -163,7 +200,7 @@ class ReceptionAgent(Agent):
         return await asyncio.to_thread(identity.confirm_registration, d.db, d.identity, user_turns(self))
 
 
-class BookingAgent(Agent):
+class BookingAgent(ClinicAgent):
     """Appointments for ONE verified patient. Created only by ReceptionAgent.start_booking, bound to that
     patient: every tool uses self.patient_id, so the model has no way to act on anyone else."""
 

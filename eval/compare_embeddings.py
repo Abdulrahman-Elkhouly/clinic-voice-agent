@@ -3,6 +3,8 @@ r"""Compare embedding models on our own test set: accuracy (English + Arabic) an
     python eval\compare_embeddings.py                 # all models
     python eval\compare_embeddings.py e5-small bge-m3 # only some (by short name)
     python eval\compare_embeddings.py gemini-3072 gemini-768   # no huggingface.co needed
+    python eval\compare_embeddings.py qwen-8b qwen-4b qwen-0.6b   # DeepInfra (DEEPINFRA_API_KEY)
+    python eval\compare_embeddings.py voyage-large voyage voyage-lite voyage-large+lite   # VOYAGE_API_KEY
 
 Retrieval only (no LLM). Uses the real chunker from rag.py and the real test set.
 """
@@ -34,9 +36,23 @@ MODELS = {
     # Cloud API: uses a task type instead of prefixes; the number is the vector size requested
     "gemini-3072": ("gemini", "gemini-embedding-001", 3072, None),
     "gemini-768": ("gemini", "gemini-embedding-001", 768, None),
+    # Cloud API (DeepInfra, OpenAI-style). Qwen3-Embedding wants an instruction before queries, none before documents.
+    "qwen-8b": ("deepinfra", "Qwen/Qwen3-Embedding-8B", "qwen", ""),
+    "qwen-4b": ("deepinfra", "Qwen/Qwen3-Embedding-4B", "qwen", ""),
+    "qwen-0.6b": ("deepinfra", "Qwen/Qwen3-Embedding-0.6B", "qwen", ""),
+    # Cloud API (Voyage): (library, query model, document model, None). The voyage-4 models share one vector space,
+    # so the knowledge base can be embedded once with the best model and searched with the fastest.
+    "voyage-large": ("voyage", "voyage-4-large", "voyage-4-large", None),
+    "voyage": ("voyage", "voyage-4", "voyage-4", None),
+    "voyage-lite": ("voyage", "voyage-4-lite", "voyage-4-lite", None),
+    "voyage-large+lite": ("voyage", "voyage-4-lite", "voyage-4-large", None),
 }
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/embeddings"
+VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
+QWEN_QUERY = "Instruct: Given a question to a clinic's phone line, retrieve the passage that answers it\nQuery: "
+BATCH = 32   # texts per API request when indexing
 
 
 def _unit(v) -> np.ndarray:
@@ -63,6 +79,51 @@ def load_encoder(name: str):
             r.raise_for_status()
             # Vectors smaller than 3072 come back unnormalized, so always normalize
             return _unit([e["values"] for e in r.json()["embeddings"]])
+        return encode
+
+    if library == "deepinfra":
+        import httpx
+        from dotenv import load_dotenv
+        load_dotenv(ROOT / ".env")
+        client = httpx.Client(headers={"Authorization": f"Bearer {os.environ['DEEPINFRA_API_KEY']}"}, timeout=60)
+
+        def encode(texts, is_query):
+            vecs = []
+            for i in range(0, len(texts), BATCH):
+                batch = [(QWEN_QUERY if is_query else "") + t for t in texts[i:i + BATCH]]
+                r = client.post(DEEPINFRA_URL, json={"model": model_id, "input": batch, "encoding_format": "float"})
+                r.raise_for_status()
+                vecs += [e["embedding"] for e in sorted(r.json()["data"], key=lambda e: e["index"])]
+            return _unit(vecs)
+        encode(["connect"], is_query=True)   # open the connection now, so "load" includes the TLS setup
+        return encode
+
+    if library == "voyage":
+        import httpx
+        from dotenv import load_dotenv
+        load_dotenv(ROOT / ".env")
+        client = httpx.Client(headers={"Authorization": f"Bearer {os.environ['VOYAGE_API_KEY']}"}, timeout=60)
+        query_model, doc_model = model_id, a
+
+        def encode(texts, is_query):
+            vecs = []
+            for i in range(0, len(texts), BATCH):
+                body = {"model": query_model if is_query else doc_model, "input": texts[i:i + BATCH],
+                        "input_type": "query" if is_query else "document"}
+                while True:
+                    t0 = time.perf_counter()
+                    r = client.post(VOYAGE_URL, json=body)
+                    if r.status_code != 429:
+                        break
+                    # Without a card on file the rate limit is low: wait it out, and don't count the wait
+                    wait = float(r.headers.get("retry-after", 20))
+                    print(f"   (rate limited, waiting {wait:.0f} s)")
+                    time.sleep(wait)
+                encode.last_ms = (time.perf_counter() - t0) * 1000
+                r.raise_for_status()
+                vecs += [e["embedding"] for e in sorted(r.json()["data"], key=lambda e: e["index"])]
+            return _unit(vecs)
+        encode(["connect"], is_query=True)   # open the connection now, so "load" includes the TLS setup
         return encode
 
     q_prefix, p_prefix = a, b
@@ -97,7 +158,8 @@ def evaluate(name: str, chunks: list[dict], tests: list[dict]) -> dict:
             continue
         t0 = time.perf_counter()
         q = encode([t["question"]], is_query=True)[0]
-        latencies.append((time.perf_counter() - t0) * 1000)
+        # API encoders that retried after a rate limit report the time of the request that succeeded
+        latencies.append(getattr(encode, "last_ms", (time.perf_counter() - t0) * 1000))
 
         scores = doc_vecs @ q
         top = np.argsort(scores)[::-1][:K]

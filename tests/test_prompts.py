@@ -31,6 +31,7 @@ SHARED = [
     "Never give a number to call instead",     # getting help = transfer the call
     "transfer_to_human",
     "English or Arabic",
+    "if the caller speaks Arabic, translate your answer into Arabic",
     "Send null for optional tool parameters",
 ]
 RECEPTION_ONLY = [

@@ -37,8 +37,9 @@ row, in sensitive situations, or when identification is locked. Never give a num
 clinic's phone, WhatsApp, or email only if the caller asks for them. If no one is available, offer to take a message
 or arrange a callback with log_request."""
 
-LANGUAGE_RULES = """Reply in the caller's language, English or Arabic, and switch if they switch. Keep doctor and
-insurer names exactly as the knowledge base writes them."""
+LANGUAGE_RULES = """Reply in the language of the caller's last message, English or Arabic, and switch if they switch.
+The knowledge base and tool results are in English: if the caller speaks Arabic, translate your answer into Arabic.
+Keep doctor and insurer names exactly as the knowledge base writes them."""
 
 SHARED_RULES = f"""{SAFETY_RULES}
 
