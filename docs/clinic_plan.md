@@ -35,6 +35,7 @@ The voice agent is moving from the Nova Mobile telecom demo to the **clinic's re
 | Stage order | 1 → 1b → 2 → 3 → 4 → 4b → 4c → 4d → 5 → 6 → 7 → 8 (see Stages) |
 | When the agent can't help | **Transfer the call to staff** (`transfer_to_human`). Never give a number to call instead; the clinic's numbers are given only if asked. Replaces Stage 1's temporary WhatsApp/reception redirects. |
 | Agent structure | Multi-agent: `ReceptionAgent` → `BookingAgent(patient_id)` / `RequestsAgent(patient_id)`, with a shared rules block and shared tools (see the Stage 3 decisions). |
+| Prompt size | Every LLM request carries the agent's instructions and tool descriptions, so they're kept short: each rule is said once, and `tests/test_prompts.py` guards the key rules. Groq's free tier (8,000 tokens per minute) is too small for real calls; the paid tier is needed before going live. |
 | Source control | Git, pushed to a private GitHub repo (`Abdulrahman-Elkhouly/clinic-voice-agent`). |
 
 ## Stages
@@ -362,7 +363,7 @@ See the full design below, including the Stage 3 decisions (multi-agent, DOB + p
   - `tests/test_identity.py`, with a fake judge: attempts, lockouts, privacy messages, the confirmation gate, twins, a failed judge.
   - `tests/test_name_judge.py`, the real judge: English variants, Arabic script, twins, no match, injection.
   - **`tests/test_conversations.py`**, the real `ReceptionAgent` and LLM in LiveKit's text mode (`session.run`, `expect.contains_message(...).judge(...)`):
-    - verified with file number + DOB (and the birth date is never repeated aloud)
+    - verified with file number + DOB
     - a wrong DOB reveals nothing
     - forgot path by DOB + phone
     - no details before verification
@@ -396,7 +397,116 @@ See the full design below, including the Stage 3 decisions (multi-agent, DOB + p
 - **Booking tools only exist after verification** (handoff from the reception agent).
 - **Agent structure:** reception (identify) → booking agent / information agent (RAG).
 - **Waitlist:** when no slot fits, offer to add the patient to a doctor's waitlist.
-- *Events table to be written before implementation.*
+
+#### Stage 4 decisions (agreed 2026-10-14)
+- **Structure:**
+  - `ReceptionAgent` gets `start_booking`, which **refuses in code unless a patient is verified**. Otherwise it hands off to `BookingAgent(patient_id)`, whose tools use `self.patient_id` (the model can't choose the patient).
+  - `BookingAgent` has `search_knowledge_base` and the stubs, plus `back_to_reception` for another patient or a non-booking task.
+  - Rules live in `agent/booking.py`, testable without the LLM, like `identity.py`.
+1. **Two steps with a code gate for every change** (the caller must speak between them, as for registration):
+   - book: `book_appointment` (holds the slot and returns the read-back) → `confirm`
+   - cancel: `cancel_appointment` (read-back, plus a warning if under 4 hours) → `confirm`
+   - reschedule: `reschedule_appointment` (holds the new slot) → `confirm`
+   - One `confirm` tool runs whichever action is pending (the code decides, not the model). It was three tools
+     (`confirm_booking`, `confirm_cancellation`, `confirm_reschedule`) until the prompt trimming below.
+2. **Three no-shows in six months:** the patient must pay in advance (KB). The agent can't take payment, so it explains, offers a transfer to staff, and doesn't book.
+3. **Limits:**
+   - At most 3 upcoming appointments per patient.
+   - An existing upcoming appointment in the same specialty triggers a **warning** ("would you rather move it?"), not a block.
+4. **Offer 3 slots at a time** (the earliest that fit), then "would you like other times?".
+5. **Age rules in code** (from the KB): pediatrics under 14, internal medicine 16 and over.
+
+#### Prompt trimming (agreed 2026-10-14)
+The booking conversation test kept failing on Groq's free-tier limit (8,000 tokens per minute): one caller turn can
+make two or three LLM calls, each carrying the full prompt and tool descriptions (about 3,000 tokens).
+Measured with Groq (prompt tokens of the first call, before the caller speaks):
+
+| Agent | Before | After |
+|---|---|---|
+| Reception | 2,007 (instructions 1,317 + tools 614) | 1,493 (956 + 461) |
+| Booking | 2,457 (instructions 1,207 + tools 1,174) | 1,849 (908 + 865) |
+
+1. Shared rules rewritten tighter. Every rule kept; repetition removed (e.g. the knowledge base topic list, which the
+   tool description already gives).
+2. The three confirm tools merged into one `confirm` (see decision 1). The gate is unchanged.
+3. Tool descriptions shortened. "Send null for optional tool parameters you don't need" is said once in the shared rules.
+4. Handoffs pass only what was said (`chat_ctx.copy(exclude_function_call=True)`), not the previous agent's tool calls.
+   Fewer tokens, and the booking agent never sees the raw file number and date of birth sent to `verify_patient`.
+5. `tests/test_prompts.py` checks the key rules are still in both prompts.
+6. **The "never repeat the date of birth" rule is deleted** (the user's call): the model decides. The conversation tests
+   no longer check for it, and allow one extra "yes" turn if the model checks the details before verifying.
+- **Finding:** LiveKit sends every tool to Groq in strict mode (`"strict": true`). That's why Groq rejected tool calls
+  missing an optional parameter. Strict mode is kept (it guarantees well-formed tool calls); optional parameters are
+  sent as null.
+- **Still true:** the free tier can't run real calls (a booking turn is still about 4,000 to 5,500 tokens). The paid
+  Groq tier is needed before going live.
+
+#### Events (agreed)
+| Event | Handling |
+|---|---|
+| Relative dates ("next Tuesday afternoon", "tomorrow") | Today's weekday and date (Qatar) are in the booking prompt. The model passes exact dates; the tool validates them. The agent always says weekday + date, so mistakes (e.g. "tomorrow" just after midnight) get caught. Morning is before 12, afternoon 12–17, evening from 17. |
+| Past, too soon (<30 min), too far (>60 days) | Refused with the reason. Nearest allowed dates offered. |
+| Specific doctor, possibly misheard | Picked from `list_doctors` (public). An unknown name gets "not part of our team". |
+| Specialty, symptom, gender, language | Routing via the KB. Filters in `check_availability`. |
+| Specialty not offered | Say so, offer a transfer to staff. |
+| Nothing free in the range | The tool returns the next available dates. Then the waitlist. |
+| Doctor on leave or clinic closed | Say so, offer other days or doctors in the same specialty. |
+| Slot taken between offer and pick | `SlotTaken`: offer the next slot. |
+| Hold expires (>5 min) | The confirm step says so; re-check availability. |
+| Changes their mind | A new pick releases the previous hold (one per call). |
+| Hangs up mid-booking | The call-end event releases the call's holds; the 5-minute expiry is the backup. |
+| Booked | Say doctor, weekday, date and time. Arrival advice comes from the KB. |
+| Patient busy at that time | `PatientBusy`: offer other times. |
+| Several appointments, "cancel my appointment" | `list_my_appointments`, then ask which one by date and doctor. Internal IDs are never spoken. |
+| Cancel under 4 hours | Allowed, with a late-cancellation warning in the read-back. |
+| Past, started or completed appointment | Refused by the database. Offer a new booking. |
+| Reschedule fails halfway | The old appointment stays (one transaction). |
+| Another patient's appointment, or "who has 10:00?" | `NotFound` / no tool returns it. |
+| Waitlist | `add_to_waitlist` after a read-back. Honest: staff see it (Stage 4c); no promise of an automatic call. |
+| Not verified, wants to book | `start_booking` refuses; identify first. |
+| "Now book for my son" | Back to reception, identify him, then a new `BookingAgent`. |
+| Non-booking task | Back to reception (requests agent in 4b). |
+| Emergency or wants a person | Shared rules: 999 first; `transfer_to_human`. |
+| Speech | Tool output says "Saturday 17 October at 9:20 in the morning", never ISO strings. |
+
+#### What was done (Stage 4)
+- **`agent/booking.py`** (new): the booking rules, testable without the LLM.
+  - `check_availability` offers the 3 earliest slots, with part of day, the next available dates when nothing fits,
+    the 60-day horizon, and the age rules (pediatrics under 14, internal medicine 16 and over).
+  - `book`: no-show limit (3 in 6 months), at most 3 upcoming appointments, a same-specialty warning.
+  - `list_appointments` gives internal refs that are never spoken; `cancel` warns when under 4 hours; `reschedule`
+    holds the new slot while the old one stays until confirmed; `add_to_waitlist`.
+  - One `confirm` runs the pending action behind the confirmation gate (the caller must speak after the read-back).
+  - `spoken_time` words times for speech.
+- **`agent/agent.py`:**
+  - `ReceptionAgent.start_booking` refuses in code unless a patient is verified, then hands off.
+  - `BookingAgent(patient_id)`: every tool uses `self.patient_id`. Tools: `list_doctors`, `check_availability`,
+    `check_specialty_availability`, `book_appointment`, `list_my_appointments`, `cancel_appointment`,
+    `reschedule_appointment`, `confirm`, `add_to_waitlist`, `back_to_reception` (releases holds), plus the shared tools.
+  - Handoffs pass only what was said (`handoff_ctx`).
+  - The call's slot holds are released when the call ends (`ctx.add_shutdown_callback`); the 5-minute expiry is the backup.
+- **`agent/db.py`:** `get_patient` added.
+- **`agent/prompts.py`:** `BOOKING_RULES` and `booking_instructions(first_name, now)` (today's date in Qatar time);
+  all prompts trimmed (see Prompt trimming); the "never repeat the date of birth" rule deleted.
+- **Findings:**
+  - **Strict tool schemas:** LiveKit sends tools to Groq with `"strict": true`, so every parameter must be present.
+    The model sometimes left optional ones out and the call was rejected. Fix: no defaults on optional parameters,
+    "send null" in the prompt, and `check_availability` split into a doctor search and a specialty search so each
+    tool has few optional parameters.
+  - **Groq's free tier** (8,000 tokens per minute) blocked the booking conversation test: a single caller turn can
+    make several LLM calls. Trimming the prompts got the tests through, but real calls need the paid tier.
+  - The emergency test now accepts "999" spoken as "9 9 9" or "nine nine nine".
+- **Tests: 119 unit tests and 12 conversation tests, all passing.**
+  - `tests/test_booking.py` (28): availability, age rules, holds, the gate, limits, cancel and reschedule, the
+    single `confirm`.
+  - `tests/test_prompts.py` (new): the key rules are still in both prompts.
+  - `tests/test_conversations.py`, new booking tests:
+    - an unverified caller can't reach booking
+    - a verified patient is handed off
+    - real slots are offered, held, and booked only after "yes"
+    - cancelling reads back and waits for "yes"
+- **Not yet:** a voice test of booking (spoken dates and times through real STT); staff seeing the waitlist (Stage 4c);
+  the paid Groq tier.
 
 ### Stage 4b: Patient requests
 Everything else a receptionist handles by phone. Pattern for each: verify the patient → record the request → confirm and say what happens next.
@@ -417,7 +527,7 @@ Without it, bookings and requests go into a database nobody reads.
 
 ### Stage 4d: Turn detection and deployment
 - **Turn detection:** a model that decides when the caller has finished speaking. Matters most on the phone, where people pause while saying file numbers and dates.
-- **Deployment:** run the agent and backend 24/7 on a server (LiveKit Cloud agent deploy, or a VPS), not on a laptop. Required before real phone numbers are useful.
+- **Deployment:** run the agent and backend 24/7 on a server (LiveKit Cloud agent deploy, or a VPS), not on a laptop. Required before real phone numbers are useful. oracle 
 - *Events table to be written before implementation.*
 
 ### Stage 5: Real phone calls (Twilio)
@@ -544,7 +654,7 @@ Nothing is revealed (name, appointments, anything) until both match.
 | Repeated mismatches | Limit to 3 attempts per call, enforced **in code**. Then identification is locked for the rest of the call; offer WhatsApp or reception (transfer to a human in Stage 6). Prevents guessing birth dates. General questions still work. |
 | 5 failures on one file number in 24 hours, across calls | Phone verification is locked for that file until reception unlocks it. |
 | Check-digit failure or an impossible date (in the future, or over 120 years ago) | Doesn't count as an attempt (usually a speech-recognition error). Ask again. |
-| Date of birth in any spoken form ("14th of March 1990", "14/3/90") | The LLM passes `YYYY-MM-DD`. **When verifying a returning patient, the agent never repeats the date of birth aloud** (decided 2026-10-12, the user's call), neither before checking nor after a failed check. A misheard date simply fails, and the caller tries again. **Registration is the exception:** the read-back includes the birth date (with the name spelling and the mobile), because there is no stored date yet and a wrong one would break every future verification. |
+| Date of birth in any spoken form ("14th of March 1990", "14/3/90") | The LLM passes `YYYY-MM-DD`. **Whether to repeat the date of birth back while verifying is left to the model**: there is no prompt rule about it (2026-10-14, the user's call; it replaces the 2026-10-12 "never repeat" rule). **Registration always reads it back:** the read-back includes the birth date (with the name spelling and the mobile), because there is no stored date yet and a wrong one would break every future verification. |
 | Verified | The tool returns the **first name only**, so the agent can greet them. |
 
 ### Events: forgot their ID

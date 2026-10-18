@@ -359,6 +359,11 @@ class ClinicDB:
                     continue   # file number already used; draw another
         raise RuntimeError("could not generate a free file number")
 
+    def get_patient(self, patient_id: int) -> dict | None:
+        with self._connect() as conn:
+            r = conn.execute("SELECT * FROM patients WHERE patient_id = ?", (patient_id,)).fetchone()
+        return _row(r) if r else None
+
     def find_by_file_number(self, file_number: str) -> dict | None:
         s = "".join(ch for ch in file_number if ch.isdigit())
         with self._connect() as conn:
