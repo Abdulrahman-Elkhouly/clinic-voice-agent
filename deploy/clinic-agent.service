@@ -1,0 +1,20 @@
+# Runs the voice agent 24/7 on the server: starts at boot, restarts after a crash.
+# Installed by the steps in docs/deploy.md (copied to /etc/systemd/system/).
+[Unit]
+Description=Clinic voice agent (LiveKit worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/clinic-voice-agent
+# Keys come from .env in the working directory (loaded by the code), never from git
+ExecStart=/home/ubuntu/clinic-voice-agent/.venv/bin/python agent/agent.py start
+Restart=always
+RestartSec=5
+# Let calls in progress finish when stopping for an update
+KillSignal=SIGINT
+TimeoutStopSec=600
+
+[Install]
+WantedBy=multi-user.target

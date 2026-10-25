@@ -1,19 +1,26 @@
 import asyncio
+import logging
+import os
+import time
 import uuid
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents import Agent, AgentSession, RunContext, function_tool
-from livekit.plugins import groq, silero
+from livekit.plugins import silero
 
 import booking
 import identity
 from booking import BookingState
 from db import ClinicDB, now_qatar
+from gemini_tts import GREETING_TEXT, STT_DOWN, GeminiTTS
 from identity import CallIdentity
-from prompts import CLINIC, booking_instructions, reception_instructions
+from llm_config import LLM_MODEL, make_llm  # noqa: F401  (LLM_MODEL: shown by talk.py and the tests)
+from prompts import booking_instructions, reception_instructions
 from rag import SEARCH_TIMEOUT, KnowledgeBase, KnowledgeBaseUnavailable
+from silence import AWAY_AFTER, SilenceWatch
+from stt_config import check_key as check_stt_key, make_stt
 
 load_dotenv()
 
@@ -48,12 +55,16 @@ async def search_knowledge_base(context: RunContext[CallData], query: str) -> st
         query: A short, specific query, e.g. "female dermatologist days".
     """
     # search() is blocking network I/O (Voyage, then Qdrant); run it in a thread so audio doesn't stutter
+    started = time.perf_counter()
     try:
         results = await asyncio.wait_for(asyncio.to_thread(context.userdata.kb.search, query, 3),
                                          SEARCH_DEADLINE)
     except (KnowledgeBaseUnavailable, asyncio.TimeoutError) as e:
         print(f"[RAG] search failed: {type(e).__name__}")
         return KB_DOWN
+    # the model's own search terms (not the caller's words), so a search that shouldn't have happened can be traced
+    logging.getLogger("timing").info("knowledge base search took %.2f s (query: %s)", time.perf_counter() - started,
+                                     query)
     print(f"[RAG] query: {query}")
     for score, chunk in results:
         print(f"[RAG]   {score:.3f}  {chunk['id']}")
@@ -93,9 +104,15 @@ async def log_request(context: RunContext[CallData], request_type: str, details:
 
 SHARED_TOOLS = [search_knowledge_base, transfer_to_human, log_request]
 
-# The prompt says to reply in the caller's language, but everything else the model sees (instructions, its greeting,
-# knowledge base results) is English, and in tests it sometimes answered Arabic questions in English.
-ARABIC_REPLY = "The caller is speaking Arabic. Write your reply in Arabic."
+# The prompt says to reply in the caller's language, but that wasn't enough either way: with English instructions and
+# knowledge base results it answered Arabic questions in English, and after the bilingual greeting it answered an
+# English question in Arabic (and invented a dentist). So the reply language is stated for every reply, in code.
+REPLY_IN = {
+    "ar": "The caller is speaking Arabic. Write your reply in Arabic, in Qatari dialect.",
+    "en": "The caller is speaking English. Write your reply in English.",
+}
+# The clinic's custom Gemini voice (Voice design), chosen 2026-10-21. Not a secret; overridable for another clinic.
+TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "voice_g4nw2fwy9yn8")
 
 
 def arabic_share(text: str) -> float:
@@ -104,21 +121,37 @@ def arabic_share(text: str) -> float:
     return sum("؀" <= ch <= "ۿ" for ch in letters) / max(1, len(letters))
 
 
-def caller_speaks_arabic(chat_ctx) -> bool:
-    last = next((item for item in reversed(chat_ctx.items) if getattr(item, "role", None) == "user"), None)
-    return last is not None and arabic_share(last.text_content or "") > 0.5
+def caller_language(chat_ctx) -> str | None:
+    """'ar' or 'en' from the caller's last message that has words (a reply like "55123456" keeps the language),
+    or None before the caller has said anything."""
+    for item in reversed(chat_ctx.items):
+        if getattr(item, "role", None) != "user":
+            continue
+        text = item.text_content or ""
+        if any(ch.isalpha() for ch in text):
+            return "ar" if arabic_share(text) > 0.5 else "en"
+    return None
+
+
+timing = logging.getLogger("timing")   # where each turn's delay goes (shown by talk.py)
 
 
 class ClinicAgent(Agent):
     """Base for every agent of the call."""
 
-    def llm_node(self, chat_ctx, tools, model_settings):
+    async def llm_node(self, chat_ctx, tools, model_settings):
         # Runs before every LLM call, including the one after a tool result. The reminder goes last, on a copy,
         # so it applies to this reply only and is never stored in the conversation.
-        if caller_speaks_arabic(chat_ctx):
+        language = caller_language(chat_ctx)
+        if language:
             chat_ctx = chat_ctx.copy()
-            chat_ctx.add_message(role="system", content=ARABIC_REPLY)
-        return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+            chat_ctx.add_message(role="system", content=REPLY_IN[language])
+        started, first = time.perf_counter(), True
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            if first:
+                timing.info("LLM first token after %.2f s", time.perf_counter() - started)
+                first = False
+            yield chunk
 
 
 def handoff_ctx(agent: Agent):
@@ -140,15 +173,19 @@ class ReceptionAgent(ClinicAgent):
             await self.session.generate_reply(
                 instructions="Continue the conversation without greeting again: help with what the caller just asked.")
         else:
-            await self.session.generate_reply(
-                instructions=f"Greet the caller, say they've reached {CLINIC}, and ask how you can help.")
+            # A fixed bilingual line (decided 2026-10-19), pre-recorded in the custom voice so it plays instantly;
+            # spoken live if the clip isn't recorded yet, and text only when there's no TTS (text-mode tests)
+            tts = self.session.tts
+            audio = tts.greeting_frames() if isinstance(tts, GeminiTTS) else None
+            await self.session.say(GREETING_TEXT, **({"audio": audio} if audio else {}))
 
     @function_tool
     async def start_booking(self, context: RunContext[CallData]):
-        """Hand over to booking for the identified patient: book, cancel, move, or check appointments."""
+        """Hand over to booking for the patient whose file is confirmed: book, cancel, move, or check appointments."""
         d = context.userdata
         if d.identity.patient_id is None:   # enforced here, not left to the prompt
-            return "No patient is identified on this call yet. Identify the patient first, then call start_booking."
+            return ("No patient's file is confirmed on this call yet. Ask whether they have a file with us or it's their "
+                    "first visit, confirm the file, then call start_booking.")
         print(f"[HANDOFF] Reception -> Booking (patient_id={d.identity.patient_id})")
         return BookingAgent(d.identity.patient_id, d.identity.patient_first_name, chat_ctx=handoff_ctx(self))
 
@@ -156,15 +193,30 @@ class ReceptionAgent(ClinicAgent):
     # The database is blocking I/O, so each call runs in a thread.
 
     @function_tool
-    async def verify_patient(self, context: RunContext[CallData], file_number: str, date_of_birth: str) -> str:
-        """Verify a returning patient by file number and date of birth.
+    async def verify_patient(self, context: RunContext[CallData], file_number: str, full_name: str) -> str:
+        """Step 1 for a returning patient: checks the file number and name, and returns the name on the file to confirm.
 
         Args:
-            file_number: Digits only.
-            date_of_birth: YYYY-MM-DD.
+            file_number: The file number (رقم الملف), digits only.
+            full_name: The patient's full name as the caller said it, in any script.
         """
         d = context.userdata
-        return await asyncio.to_thread(identity.verify, d.db, d.identity, file_number, date_of_birth)
+        return await asyncio.to_thread(identity.verify, d.db, d.identity, file_number, full_name, user_turns(self))
+
+    @function_tool
+    async def confirm_patient(self, context: RunContext[CallData], wants_appointments: bool):
+        """Step 2: the caller confirmed the name on the file read back to them.
+
+        Args:
+            wants_appointments: True if the caller wants to book, cancel, move, or check appointments.
+        """
+        d = context.userdata
+        result = identity.confirm_patient(d.identity, user_turns(self))
+        if wants_appointments and result.startswith("Confirmed"):
+            # straight to booking: saves a separate start_booking call (a whole LLM round trip)
+            print(f"[HANDOFF] Reception -> Booking (patient_id={d.identity.patient_id})")
+            return BookingAgent(d.identity.patient_id, d.identity.patient_first_name, chat_ctx=handoff_ctx(self))
+        return result
 
     @function_tool
     async def find_patient(self, context: RunContext[CallData], date_of_birth: str, phone: str,
@@ -172,7 +224,7 @@ class ReceptionAgent(ClinicAgent):
         """Find a returning patient who forgot their file number.
 
         Args:
-            date_of_birth: YYYY-MM-DD.
+            date_of_birth: YYYY-MM-DD, Gregorian or Hijri as the caller said it (e.g. 1410-08-17; converted for you).
             phone: The phone number on their file, digits only.
             full_name: Null unless a previous find_patient result asked for it.
         """
@@ -186,7 +238,7 @@ class ReceptionAgent(ClinicAgent):
 
         Args:
             full_name: As they spelled it.
-            date_of_birth: YYYY-MM-DD.
+            date_of_birth: YYYY-MM-DD, Gregorian or Hijri as the caller said it (e.g. 1410-08-17; converted for you).
             phone: The patient's mobile, digits only.
             guardian_phone: A child's parent or guardian number, digits only, or null.
         """
@@ -233,23 +285,24 @@ class BookingAgent(ClinicAgent):
 
     @function_tool
     async def check_availability(self, context: RunContext[CallData], doctor_name: str, date_from: str,
-                                 date_to: str | None, part_of_day: str | None) -> str:
-        """Earliest free times with one doctor.
+                                 date_to: str | None, part_of_day: str | None, time: str | None) -> str:
+        """Free times with one doctor: the earliest, or around a specific time.
 
         Args:
             doctor_name: Exact name, e.g. "Dr. Omar Benali".
             date_from: YYYY-MM-DD.
             date_to: YYYY-MM-DD, or null for date_from only.
             part_of_day: "morning", "afternoon", "evening", or null.
+            time: A specific time the caller asked for, HH:MM 24-hour (e.g. "13:20"), or null.
         """
         return await self._run(booking.check_availability, context.userdata.db, self.patient_id, date_from,
-                               date_to, doctor_name, None, part_of_day)
+                               date_to, doctor_name, None, part_of_day, None, None, time)
 
     @function_tool
     async def check_specialty_availability(self, context: RunContext[CallData], specialty: str, date_from: str,
                                            date_to: str | None, part_of_day: str | None, gender: str | None,
-                                           language: str | None) -> str:
-        """Earliest free times with any doctor in a specialty.
+                                           language: str | None, time: str | None) -> str:
+        """Free times with any doctor in a specialty: the earliest, or around a specific time.
 
         Args:
             specialty: e.g. "orthopedics".
@@ -258,9 +311,10 @@ class BookingAgent(ClinicAgent):
             part_of_day: "morning", "afternoon", "evening", or null.
             gender: "female", "male", or null.
             language: A language the doctor speaks, or null.
+            time: A specific time the caller asked for, HH:MM 24-hour (e.g. "13:20"), or null.
         """
         return await self._run(booking.check_availability, context.userdata.db, self.patient_id, date_from,
-                               date_to, None, specialty, part_of_day, gender, language)
+                               date_to, None, specialty, part_of_day, gender, language, time)
 
     @function_tool
     async def book_appointment(self, context: RunContext[CallData], doctor_name: str, start: str) -> str:
@@ -268,7 +322,7 @@ class BookingAgent(ClinicAgent):
 
         Args:
             doctor_name: Exactly as returned by availability.
-            start: Exactly as returned, "YYYY-MM-DD HH:MM".
+            start: "YYYY-MM-DD HH:MM", a time the caller chose inside the free hours returned.
         """
         d = context.userdata
         return await self._run(booking.book, d.db, d.booking, self.patient_id, doctor_name, start, d.call_id,
@@ -298,7 +352,7 @@ class BookingAgent(ClinicAgent):
         Args:
             ref: From list_my_appointments.
             doctor_name: Exactly as returned by availability.
-            start: Exactly as returned, "YYYY-MM-DD HH:MM".
+            start: "YYYY-MM-DD HH:MM", a time the caller chose inside the free hours returned.
         """
         d = context.userdata
         return await self._run(booking.reschedule, d.db, d.booking, self.patient_id, ref, doctor_name, start,
@@ -341,22 +395,59 @@ class BookingAgent(ClinicAgent):
 
 def prewarm(proc: agents.JobProcess):
     # Runs once per worker process, before any call
+    check_stt_key()   # no key: refuse to start, rather than take calls it can't hear
     proc.userdata["vad"] = silero.VAD.load()
     proc.userdata["kb"] = KnowledgeBase()
     proc.userdata["db"] = ClinicDB()
+    missing = GeminiTTS(voice=TTS_VOICE).missing_clips()
+    if missing:   # still works, but the greeting is slow and fillers are silent: make it visible in the logs
+        logging.getLogger("startup").warning("%d pre-recorded line(s) missing for %s; run agent/prerecord_voice.py: %s",
+                                             len(missing), TTS_VOICE, missing)
 
 
 async def entrypoint(ctx: agents.JobContext):
     await ctx.connect()
 
     data = CallData(kb=ctx.proc.userdata["kb"], db=ctx.proc.userdata["db"])
+    voice = GeminiTTS(voice=TTS_VOICE)   # custom voice, streamed; see gemini_tts.py for how the delay is handled
     session = AgentSession[CallData](
         userdata=data,
-        stt="deepgram/nova-3",
-        llm=groq.LLM(model="openai/gpt-oss-120b"),
-        tts="cartesia/sonic-2",
+        stt=make_stt(vad=ctx.proc.userdata["vad"]),   # Soniox, setting F (stt_config.py); finalize uses this VAD
+        llm=make_llm(),
+        tts=voice,
         vad=ctx.proc.userdata["vad"],
+        user_away_timeout=AWAY_AFTER,   # silence before each check-in step (silence.py)
     )
+
+    # Caller goes quiet: check in, offer help, then say goodbye and end the call (silence.py)
+    async def say_line(text: str) -> None:
+        audio = voice.clip_frames(text)   # pre-recorded, so it plays at once
+        await session.say(text, **({"audio": audio} if audio else {}))
+
+    async def hang_up(reason: str = "caller silent") -> None:
+        session.shutdown()
+        ctx.shutdown(reason=reason)   # runs release_holds below
+
+    watch = SilenceWatch(say_line, hang_up, lambda: session.history, caller_language)
+    session.on("user_state_changed", lambda ev: watch.on_user_state(ev.new_state))
+
+    # Speech-to-text down for good (LiveKit already retried): the agent can't hear the caller, so say so and
+    # transfer (Stage 6; until then end the call). No fallback provider (the user's call).
+    stt_down = {"handled": False}
+
+    async def on_stt_down() -> None:
+        lang = caller_language(session.history)
+        for text in ([STT_DOWN[lang]] if lang else [STT_DOWN["ar"], STT_DOWN["en"]]):
+            await say_line(text)
+        print("[STUB] transfer_to_human: speech-to-text down")
+        await hang_up("speech-to-text down")
+
+    def on_error(ev) -> None:
+        if getattr(ev.error, "type", None) == "stt_error" and not ev.error.recoverable and not stt_down["handled"]:
+            stt_down["handled"] = True
+            logging.getLogger("stt").error("speech-to-text down: %s", ev.error.error)
+            asyncio.create_task(on_stt_down())
+    session.on("error", on_error)
 
     # Caller hung up (or the call ended): release any slot this call was holding right away.
     # The 5-minute hold expiry is the backup if this never runs (e.g. the process crashes).

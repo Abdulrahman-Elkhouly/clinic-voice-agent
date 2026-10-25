@@ -5,7 +5,6 @@ r"""Evaluate the agent's RAG and safety behaviour against eval/test_set.md, with
     python eval\eval_rag.py --chat   # type your own questions, get retrieval + answers
 """
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -13,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "agent"))
 
+from llm_config import EXTRA, MODEL as LLM  # noqa: E402
 from rag import KnowledgeBase  # noqa: E402
 
 K = 3
@@ -119,7 +119,7 @@ def ask_agent(client, kb: KnowledgeBase, prompt: str, question: str) -> tuple[st
     queries = []
     for _ in range(4):   # a few tool rounds at most
         msg = client.chat.completions.create(
-            model="openai/gpt-oss-120b", messages=messages, tools=[SEARCH_TOOL],
+            model=LLM, messages=messages, tools=[SEARCH_TOOL], **EXTRA,   # the same model as the live agent
         ).choices[0].message
         if not msg.tool_calls:
             return (msg.content or "").strip(), queries
@@ -136,11 +136,8 @@ def ask_agent(client, kb: KnowledgeBase, prompt: str, question: str) -> tuple[st
 
 
 def make_client():
-    from dotenv import load_dotenv
-    from openai import OpenAI  # Groq's API is OpenAI-compatible
-
-    load_dotenv(ROOT / ".env")
-    return OpenAI(api_key=os.environ["GROQ_API_KEY"], base_url="https://api.groq.com/openai/v1")
+    from llm_config import chat_client   # the LLM configured in LLM_MODEL (OpenAI or Groq)
+    return chat_client(timeout=60)
 
 
 def chat(kb: KnowledgeBase, client, prompt: str):

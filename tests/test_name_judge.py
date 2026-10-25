@@ -1,9 +1,9 @@
-"""Tests for the real name judge (agent/name_judge.py) against Groq: spelling variants, Arabic script,
-different people, and an injection attempt.
+"""Tests for the real name judge (agent/name_judge.py) on the configured LLM (llm_config.LLM_MODEL): spelling
+variants, Arabic script, different people, and an injection attempt.
 
     $env:CONVO_TESTS=1; python -m pytest tests/test_name_judge.py -v     (PowerShell)
 
-Opt-in like the conversation tests (uses the Groq quota); also needs GROQ_API_KEY.
+Opt-in like the conversation tests (uses the LLM provider's quota); needs that provider's API key.
 """
 import os
 import sys
@@ -16,10 +16,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "agent"))
 load_dotenv(ROOT / ".env")
 
+from llm_config import API_KEYS, PROVIDER  # noqa: E402
 from name_judge import clean_name, pick_matching_name  # noqa: E402
 
-needs_llm = pytest.mark.skipif(not (os.environ.get("CONVO_TESTS") and os.environ.get("GROQ_API_KEY")),
-                               reason="opt-in: set CONVO_TESTS=1 (needs GROQ_API_KEY)")
+needs_llm = pytest.mark.skipif(not (os.environ.get("CONVO_TESTS") and os.environ.get(API_KEYS[PROVIDER])),
+                               reason=f"opt-in: set CONVO_TESTS=1 (needs {API_KEYS[PROVIDER]})")
 
 
 def test_clean_name_strips_everything_but_name_characters():
@@ -37,6 +38,8 @@ def test_clean_name_strips_everything_but_name_characters():
     ("محمد الكعبي", ["Mohammed Al-Kaabi", "Yousef Al-Kaabi"], 0),
     ("Khalid Ali", ["Ahmed Ali", "Omar Ali"], None),                         # same family name, nobody matches
     ("Omar", ["Ahmed Ali", "Omar Ali"], 1),                                  # first name only
+    ("Fatima Saleh", ["Fatima Al-Naimi"], None),                             # same first name, other family
+    ("فاطمة النعيمي", ["Fatima Al-Naimi"], 0),                                # verification in Arabic
 ])
 def test_judge(heard, candidates, expected):
     assert pick_matching_name(heard, candidates) == expected

@@ -9,6 +9,7 @@ Like identity.py, every rule is enforced here in code and testable without the L
 Each function returns the text handed to the LLM as the tool result. Appointment IDs never reach it:
 listed appointments get per-call reference numbers that map to IDs here.
 """
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -44,6 +45,52 @@ def spoken_time(dt: datetime) -> str:
 def slot_key(start: datetime) -> str:
     """The start time as the model passes it back to book a slot."""
     return f"{start.astimezone(QATAR_TZ):%Y-%m-%d %H:%M}"
+
+
+# How free times are described (agreed 2026-10-22): listing "9:00, 9:20 or 9:40" made those sound like the only
+# times. A day with many free times is described by its free hours ("from 9:00 to 2:40"); only a few are named.
+FEW_SLOTS = 3          # this many free times on a day, or fewer: name them; more: give the free hours as ranges
+DAYS_SUGGESTED = 3     # when no single day was asked for: the earliest days with free times
+
+
+def spoken_clock(dt: datetime) -> str:
+    """'9:20 in the morning'"""
+    dt = dt.astimezone(QATAR_TZ)
+    part = "in the morning" if dt.hour < 12 else "in the afternoon" if dt.hour < 17 else "in the evening"
+    return f"{dt.hour % 12 or 12}:{dt:%M} {part}"
+
+
+def spoken_day(day: date) -> str:
+    """'Saturday 24 October'"""
+    return f"{day:%A} {day.day} {day:%B}"
+
+
+def free_ranges(slots: list[dict]) -> list[tuple[datetime, datetime]]:
+    """Consecutive free slots merged: [(first start, last start), ...]. A taken slot splits a range."""
+    ranges = []
+    for s in sorted(slots, key=lambda s: s["start_at"]):
+        if ranges and s["start_at"] == ranges[-1][2]:   # starts where the previous one ends
+            ranges[-1] = (ranges[-1][0], s["start_at"], s["end_at"])
+        else:
+            ranges.append((s["start_at"], s["start_at"], s["end_at"]))
+    return [(first, last) for first, last, _ in ranges]
+
+
+def describe_day(day_slots: list[dict]) -> str:
+    """One day's free times for one doctor: named if few, else as free hours."""
+    doctor = day_slots[0]["doctor"]
+    day = spoken_day(day_slots[0]["start_at"].astimezone(QATAR_TZ).date())
+    if len(day_slots) <= FEW_SLOTS:
+        times = "; ".join(f"{spoken_clock(s['start_at'])} [book with: doctor='{doctor}', "
+                          f"start='{slot_key(s['start_at'])}']" for s in day_slots)
+        return f"{day} with {doctor}, only these times: {times}"
+    minutes = int((day_slots[0]["end_at"] - day_slots[0]["start_at"]).total_seconds() // 60)
+    spans = " and ".join(f"from {spoken_clock(a)} to {spoken_clock(b)}" if a != b else f"at {spoken_clock(a)}"
+                         for a, b in free_ranges(day_slots))
+    first = day_slots[0]["start_at"].astimezone(QATAR_TZ)
+    return (f"{day} with {doctor}: free {spans} (a time every {minutes} minutes; the last time in each range is "
+            f"the last start) [book with: doctor='{doctor}', start='{first:%Y-%m-%d} HH:MM' on that "
+            f"{minutes}-minute grid]")
 
 
 def _parse_start(text: str) -> datetime | None:
@@ -105,9 +152,20 @@ def _age_problem(patient: dict, specialty: str, on: date) -> str | None:
 
 # --- Availability ---
 
+def _parse_time(text: str | None) -> int | None:
+    """'13:20' -> minutes after midnight, or None."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", text or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
 def check_availability(db: ClinicDB, patient_id: int, date_from_text: str, date_to_text: str | None = None,
                        doctor_name: str | None = None, specialty: str | None = None, part_of_day: str | None = None,
-                       gender: str | None = None, language: str | None = None, now: datetime | None = None) -> str:
+                       gender: str | None = None, language: str | None = None, time_text: str | None = None,
+                       now: datetime | None = None) -> str:
+    """Up to 3 free times. With `time_text`, that exact time first if it's free, else the nearest ones; without it,
+    the earliest (it used to have no way to ask for a specific time, so "1:20" looked unavailable)."""
     now = now or now_qatar()
     d_from = _parse_date(date_from_text)
     if d_from is None:
@@ -117,6 +175,11 @@ def check_availability(db: ClinicDB, patient_id: int, date_from_text: str, date_
         d_from, d_to = d_to, d_from
     if part_of_day and part_of_day.lower() not in PARTS_OF_DAY:
         return "part_of_day must be morning, afternoon, or evening."
+    wanted = _parse_time(time_text)
+    if time_text and wanted is None:
+        return "time must be HH:MM in 24-hour time, e.g. 13:20."
+    if wanted is not None:
+        part_of_day = None   # a specific time decides on its own
     last_day = (now + HORIZON).date()
     if d_from > last_day:
         return (f"Bookings open only {HORIZON.days} days ahead, up to {last_day:%A} {last_day.day} {last_day:%B}. "
@@ -153,18 +216,57 @@ def check_availability(db: ClinicDB, patient_id: int, date_from_text: str, date_
 
     slots = matching(d_from, min(d_to, last_day))
     note = ""
+    one_day = d_from == d_to
     if not slots:   # nothing in the range: look for the next available dates instead
         slots = matching(d_to + timedelta(days=1), last_day)
         if not slots:
             return ("No free appointments in the next "
                     f"{HORIZON.days} days for that. Offer the waitlist (add_to_waitlist) or other doctors.")
-        note = "Nothing is free in the dates asked for. Say so, then offer these next available times instead. "
-    offered = slots[:SLOTS_OFFERED]
+        note = "Nothing is free in the dates asked for. Say so first. "
+        one_day = False
+    if wanted is None:
+        return note + _describe(slots, one_day)
+    # a specific time: that time first if free, then the nearest times on the same (earliest) day
+    return note + _nearest(slots, wanted)
+
+
+def _minutes(s: dict) -> int:
+    t = s["start_at"].astimezone(QATAR_TZ)
+    return t.hour * 60 + t.minute
+
+
+def _nearest(slots: list[dict], wanted: int) -> str:
+    """The asked-for time if free, else the nearest free times that day, with booking keys."""
+    exact = [s for s in slots if _minutes(s) == wanted]
+    first_day = (exact[0] if exact else slots[0])["start_at"].date()
+    near = sorted([s for s in slots if s["start_at"].date() == first_day],
+                  key=lambda s: (abs(_minutes(s) - wanted), s["start_at"]))[:SLOTS_OFFERED]
     lines = "; ".join(f"{spoken_time(s['start_at'])} with {s['doctor']} [book with: doctor='{s['doctor']}', "
-                      f"start='{slot_key(s['start_at'])}']" for s in offered)
-    more = " More times exist; offer them if none of these suit." if len(slots) > SLOTS_OFFERED else ""
-    return (f"{note}Offer these times, saying the weekday, date, time and doctor (never read out the "
-            f"bracketed part): {lines}.{more}")
+                      f"start='{slot_key(s['start_at'])}']" for s in near)
+    if exact:
+        return f"That time is free: {lines.split('; ')[0]}. Book it if it's the time the caller chose."
+    return (f"That exact time isn't free. Say so, then offer the nearest times (never read out the bracketed "
+            f"part): {lines}.")
+
+
+def _describe(slots: list[dict], one_day: bool) -> str:
+    """Free times as the caller should hear them: for one day, its free hours (or the few times left); otherwise
+    the earliest days, so the caller can choose a day first."""
+    days: dict[tuple, list[dict]] = {}
+    for s in slots:
+        days.setdefault((s["start_at"].astimezone(QATAR_TZ).date(), s["doctor"]), []).append(s)
+    order = sorted(days)
+    if one_day:
+        shown = [days[k] for k in order if k[0] == order[0][0]]
+        return ("Free times (never read out the bracketed parts): " + "; ".join(describe_day(d) for d in shown) +
+                ". Tell the caller the free hours as ranges, not as a list of times (name the times only when "
+                "just a few are left), and ask what time suits them. When they name a time inside the free hours, "
+                "call book_appointment with that time; if it isn't free, the tool offers the nearest ones.")
+    first_days = sorted({k[0] for k in order})[:DAYS_SUGGESTED]
+    shown = [days[k] for k in order if k[0] in first_days]
+    return ("Free days (never read out the bracketed parts): " + "; ".join(describe_day(d) for d in shown) +
+            f". Suggest the earliest day first ({spoken_day(first_days[0])}) and ask if it suits; describe its "
+            "free hours only once the caller has chosen a day.")
 
 
 # --- Two-step actions ---
@@ -201,8 +303,11 @@ def book(db: ClinicDB, state: BookingState, patient_id: int, doctor_name: str, s
 
     try:
         hold = db.hold_slot(patient_id, doctor["doctor_id"], start, call_id=call_id, now=now)
-    except BookingError as e:
-        return str(e)
+    except BookingError as e:   # not a free slot: offer the nearest ones in the same reply, saving a round trip
+        free = [{**s, "doctor": doctor["name"]}
+                for s in db.free_slots(doctor["doctor_id"], start.date(), start.date(), now=now)]
+        nearest = (" " + _nearest(free, start.hour * 60 + start.minute)) if free else ""
+        return str(e) + nearest
     state.pending = {"kind": "book", "hold_id": hold["appointment_id"], "user_turns": user_turns}
     same = [a for a in upcoming if a["specialty"] == doctor["specialty"]]
     warning = (f" Before asking, mention they already have an appointment in {doctor['specialty']} on "

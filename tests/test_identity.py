@@ -49,59 +49,93 @@ def valid_unknown_file_number() -> str:
     return base + luhn_check_digit(base)
 
 
-def test_verify_success_gives_first_name_only(clinic):
+def verify(clinic_or_db, state, file_number, name, turns=1, judge=None, now=NOW):
+    db = clinic_or_db["db"] if isinstance(clinic_or_db, dict) else clinic_or_db
+    return identity.verify(db, state, file_number, name, turns, now=now, judge=judge or judge_says(name))
+
+
+def test_verify_reads_back_the_name_on_the_file_then_confirms(clinic):
     state = CallIdentity()
-    msg = identity.verify(clinic["db"], state, clinic["fatima"]["file_number"], "1990-03-14", now=NOW)
-    assert msg.startswith("Verified") and "Fatima" in msg
-    assert "Al-Naimi" not in msg and clinic["fatima"]["file_number"] not in msg
+    judge = judge_says("Fatima Al-Naimi")
+    msg = identity.verify(clinic["db"], state, clinic["fatima"]["file_number"], "فاطمة النعيمي", 1, now=NOW,
+                          judge=judge)
+    assert "Fatima Al-Naimi" in msg and "confirm_patient" in msg   # the name ON FILE, not the caller's version
+    assert judge.seen == [("فاطمة النعيمي", ["Fatima Al-Naimi"])]
+    assert state.patient_id is None                                # not yet: the caller must confirm
+    assert "hasn't answered" in identity.confirm_patient(state, 1)   # same turn: refused
+    msg = identity.confirm_patient(state, 2)
+    assert msg.startswith("Confirmed") and "Fatima" in msg and clinic["fatima"]["file_number"] not in msg
     assert state.patient_id == clinic["fatima"]["patient_id"]
 
 
-def test_wrong_dob_and_unknown_file_give_the_same_message(clinic):
+def test_confirm_with_nothing_waiting(clinic):
+    assert "No file is waiting" in identity.confirm_patient(CallIdentity(), 5)
+
+
+def test_wrong_name_and_unknown_file_give_the_same_message(clinic):
     s1, s2 = CallIdentity(), CallIdentity()
-    wrong_dob = identity.verify(clinic["db"], s1, clinic["fatima"]["file_number"], "1990-03-15", now=NOW)
-    unknown = identity.verify(clinic["db"], s2, valid_unknown_file_number(), "1990-03-14", now=NOW)
-    assert wrong_dob == unknown   # never reveals whether the file exists
-    assert "don't match" in wrong_dob and s1.patient_id is None
+    wrong_name = identity.verify(clinic["db"], s1, clinic["fatima"]["file_number"], "Huda Saleh", 1, now=NOW,
+                                 judge=judge_says(None))
+    unknown = identity.verify(clinic["db"], s2, valid_unknown_file_number(), "Fatima Al-Naimi", 1, now=NOW,
+                              judge=no_judge_expected)
+    assert wrong_name == unknown   # never reveals whether the file exists
+    assert "don't match" in wrong_name and s1.pending_patient is None and s1.patient_id is None
+
+
+def test_a_first_name_alone_is_asked_again_without_counting(clinic):
+    state = CallIdentity()
+    msg = identity.verify(clinic["db"], state, clinic["fatima"]["file_number"], "Fatima", 1, now=NOW,
+                          judge=no_judge_expected)
+    assert "full name" in msg and state.failed_attempts == 0
+
+
+def test_a_failed_judge_never_guesses_and_reveals_nothing(clinic):
+    s1, s2 = CallIdentity(), CallIdentity()
+    broken = identity.verify(clinic["db"], s1, clinic["fatima"]["file_number"], "Fatima Al-Naimi", 1, now=NOW,
+                             judge=broken_judge)
+    unknown = identity.verify(clinic["db"], s2, valid_unknown_file_number(), "Fatima Al-Naimi", 1, now=NOW,
+                              judge=no_judge_expected)
+    assert broken == unknown and s1.pending_patient is None
 
 
 def test_check_digit_failure_does_not_count_as_an_attempt(clinic):
     state = CallIdentity()
     good = clinic["fatima"]["file_number"]
     misheard = good[:-1] + str((int(good[-1]) + 1) % 10)
-    msg = identity.verify(clinic["db"], state, misheard, "1990-03-14", now=NOW)
+    msg = identity.verify(clinic["db"], state, misheard, "Fatima Al-Naimi", 1, now=NOW, judge=no_judge_expected)
     assert "repeat" in msg and state.failed_attempts == 0
-
-
-@pytest.mark.parametrize("dob", ["2030-01-01", "1850-01-01", "14/03/1990", ""])
-def test_impossible_or_malformed_dates_are_rejected_without_counting(clinic, dob):
-    state = CallIdentity()
-    msg = identity.verify(clinic["db"], state, clinic["fatima"]["file_number"], dob, now=NOW)
-    assert "YYYY-MM-DD" in msg and state.failed_attempts == 0
 
 
 def test_three_failures_lock_the_call_even_for_correct_details(clinic):
     db, state = clinic["db"], CallIdentity()
     unknown = valid_unknown_file_number()
-    assert "2 more times" in identity.verify(db, state, unknown, "1990-01-01", now=NOW)
-    assert "1 more time" in identity.verify(db, state, unknown, "1990-01-01", now=NOW)
-    assert "locked" in identity.verify(db, state, unknown, "1990-01-01", now=NOW)
+    assert "2 more times" in verify(db, state, unknown, "Fatima Al-Naimi")
+    assert "1 more time" in verify(db, state, unknown, "Fatima Al-Naimi")
+    assert "locked" in verify(db, state, unknown, "Fatima Al-Naimi")
     assert state.locked
-    msg = identity.verify(db, state, clinic["fatima"]["file_number"], "1990-03-14", now=NOW)
-    assert "locked" in msg and state.patient_id is None
+    msg = verify(db, state, clinic["fatima"]["file_number"], "Fatima Al-Naimi")
+    assert "locked" in msg and state.pending_patient is None
     assert "locked" in identity.find(db, state, "1990-03-14", "55123456", now=NOW)
 
 
 def test_five_failures_across_calls_lock_the_file(tmp_path):
     db = ClinicDB(tmp_path / "lock.db")
     p = db.create_patient("Fatima Al-Naimi", date(1990, 3, 14), "5512 3456", now=NOW)
-    for call in range(5):   # five separate calls, one wrong guess each
-        identity.verify(db, CallIdentity(), p["file_number"], f"1990-01-0{call + 1}", now=NOW + timedelta(minutes=call))
-    msg = identity.verify(db, CallIdentity(), p["file_number"], "1990-03-14", now=NOW + timedelta(minutes=10))
-    assert "isn't possible" in msg   # even the right birthday is refused until reception unlocks it
+    for call in range(5):   # five separate calls, one wrong name each
+        identity.verify(db, CallIdentity(), p["file_number"], f"Wrong Name{call}", 1,
+                        now=NOW + timedelta(minutes=call), judge=judge_says(None))
+    msg = verify(db, CallIdentity(), p["file_number"], "Fatima Al-Naimi", now=NOW + timedelta(minutes=10))
+    assert "isn't possible" in msg   # even the right name is refused until reception unlocks it
     db.unlock_verification(p["file_number"], now=NOW + timedelta(minutes=11))
-    msg = identity.verify(db, CallIdentity(), p["file_number"], "1990-03-14", now=NOW + timedelta(minutes=12))
-    assert msg.startswith("Verified")
+    msg = verify(db, CallIdentity(), p["file_number"], "Fatima Al-Naimi", now=NOW + timedelta(minutes=12))
+    assert "Fatima Al-Naimi" in msg and "confirm_patient" in msg
+
+
+@pytest.mark.parametrize("dob", ["2030-01-01", "1850-01-01", "14/03/1990", ""])
+def test_impossible_or_malformed_dates_are_rejected_without_counting(clinic, dob):
+    state = CallIdentity()
+    msg = identity.find(clinic["db"], state, dob, "55123456", now=NOW, judge=no_judge_expected)
+    assert "YYYY-MM-DD" in msg and state.failed_attempts == 0
 
 
 def test_find_by_dob_and_phone_reads_the_file_number(clinic):
@@ -209,6 +243,8 @@ def test_correcting_details_replaces_the_pending_registration(clinic):
 
 def test_switching_patient_is_announced(clinic):
     db, state = clinic["db"], CallIdentity()
-    identity.verify(db, state, clinic["fatima"]["file_number"], "1990-03-14", now=NOW)
-    msg = identity.verify(db, state, clinic["twin1"]["file_number"], "1992-02-02", now=NOW)
+    verify(db, state, clinic["fatima"]["file_number"], "Fatima Al-Naimi", turns=1)
+    identity.confirm_patient(state, 2)
+    verify(db, state, clinic["twin1"]["file_number"], "Ahmed Ali", turns=3)
+    msg = identity.confirm_patient(state, 4)
     assert "active patient is now" in msg and state.patient_id == clinic["twin1"]["patient_id"]

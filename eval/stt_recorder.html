@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STT Recorder</title>
+<style>
+:root { --bg:#fff; --fg:#1d1d1f; --muted:#6e6e73; --line:#e5e5ea; --panel:#f5f5f7; --accent:#0a66d8;
+        --rec:#d70015; --ok:#248a3d; }
+@media (prefers-color-scheme: dark) { :root { --bg:#1c1c1e; --fg:#f2f2f7; --muted:#a1a1a6; --line:#3a3a3c;
+        --panel:#2c2c2e; --accent:#409cff; --rec:#ff453a; --ok:#30d158; } }
+* { box-sizing:border-box; }
+body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; margin:0; }
+.wrap { display:grid; grid-template-columns:1fr 280px; gap:24px; max-width:1100px; margin:0 auto; padding:24px 16px; }
+@media (max-width:800px) { .wrap { grid-template-columns:1fr; } }
+.card { background:var(--panel); border-radius:12px; padding:24px; }
+.meta { color:var(--muted); font-size:13px; }
+.text { font-size:32px; line-height:1.6; margin:16px 0 8px; unicode-bidi:plaintext; }
+.hint { color:var(--muted); font-size:18px; unicode-bidi:plaintext; min-height:1.5em; }
+.buttons { display:flex; flex-wrap:wrap; gap:8px; margin-top:24px; }
+button { font:inherit; padding:10px 18px; border-radius:8px; border:1px solid var(--line); background:var(--bg);
+         color:var(--fg); cursor:pointer; }
+button:disabled { opacity:.4; cursor:default; }
+button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+button.rec { background:var(--rec); color:#fff; border-color:var(--rec); }
+.meter { height:10px; background:var(--line); border-radius:5px; overflow:hidden; margin-top:20px; }
+.meter div { height:100%; width:0; background:var(--ok); transition:width .05s; }
+.status { margin-top:12px; min-height:1.5em; }
+select { font:inherit; padding:6px; border-radius:6px; border:1px solid var(--line); background:var(--bg);
+         color:var(--fg); max-width:100%; }
+ol { padding:0; margin:0; list-style:none; max-height:75vh; overflow:auto; }
+li { padding:6px 8px; border-radius:6px; cursor:pointer; font-size:13px; display:flex; gap:6px; }
+li:hover { background:var(--panel); }
+li.current { background:var(--panel); font-weight:600; }
+li .done { color:var(--ok); width:1em; }
+kbd { border:1px solid var(--line); border-radius:4px; padding:0 4px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <main>
+    <div class="meta">Microphone: <select id="mic"></select></div>
+    <div class="card" style="margin-top:12px">
+      <div class="meta" id="where"></div>
+      <div class="text" id="text" dir="auto"></div>
+      <div class="hint" id="hint" dir="auto"></div>
+      <div class="meter"><div id="level"></div></div>
+      <div class="buttons">
+        <button id="recBtn" class="primary">Record <kbd>Space</kbd></button>
+        <button id="playBtn" disabled>Play <kbd>P</kbd></button>
+        <button id="keepBtn" disabled>Keep and next <kbd>Enter</kbd></button>
+        <button id="nextBtn">Skip</button>
+      </div>
+      <div class="status meta" id="status"></div>
+    </div>
+    <p class="meta">Speak as on a phone call, mic close to your mouth. Leave about a second of quiet before and
+      after speaking. The green bar should move well but not stay at the end.</p>
+  </main>
+  <aside><div class="meta" id="count"></div><ol id="list"></ol></aside>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let lines = [], current = 0, ctx, source, node, stream, recording = false, chunks = [], take = null;
+
+async function loadLines() {
+  lines = await (await fetch("/lines")).json();
+  const firstTodo = lines.findIndex(l => !l.done);
+  current = firstTodo === -1 ? 0 : firstTodo;
+  render();
+}
+
+function render() {
+  const l = lines[current];
+  $("where").textContent = `${current + 1} / ${lines.length} · ${l.group} · ${l.id}` + (l.done ? " · recorded" : "");
+  $("text").textContent = l.text;
+  $("hint").textContent = l.hint;
+  $("count").textContent = `${lines.filter(x => x.done).length} of ${lines.length} recorded`;
+  $("list").innerHTML = "";
+  lines.forEach((x, i) => {
+    const li = document.createElement("li");
+    li.className = i === current ? "current" : "";
+    li.innerHTML = `<span class="done">${x.done ? "✓" : ""}</span><span></span>`;
+    li.lastChild.textContent = x.id;
+    li.onclick = () => { if (!recording) { current = i; take = null; buttons(); render(); } };
+    $("list").appendChild(li);
+  });
+  $("list").children[current].scrollIntoView({ block: "nearest" });
+}
+
+function buttons() {
+  $("recBtn").textContent = recording ? "Stop" : (take ? "Redo" : "Record");
+  $("recBtn").className = recording ? "rec" : "primary";
+  $("recBtn").insertAdjacentHTML("beforeend", " <kbd>Space</kbd>");
+  $("playBtn").disabled = $("keepBtn").disabled = recording || !take;
+  $("nextBtn").disabled = recording;
+}
+
+async function openMic(deviceId) {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  // Raw microphone: the browser's own echo cancelling, noise removal, and volume control are off.
+  stream = await navigator.mediaDevices.getUserMedia({ audio: {
+    deviceId: deviceId ? { exact: deviceId } : undefined, channelCount: 1,
+    echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  if (!ctx) {
+    ctx = new AudioContext();
+    const code = `class Rec extends AudioWorkletProcessor {
+      process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice(0)); return true; } }
+      registerProcessor("rec", Rec);`;
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+    node = new AudioWorkletNode(ctx, "rec");
+    const mute = ctx.createGain(); mute.gain.value = 0;
+    node.connect(mute).connect(ctx.destination);
+    node.port.onmessage = e => {
+      let peak = 0; for (const v of e.data) peak = Math.max(peak, Math.abs(v));
+      $("level").style.width = Math.min(100, peak * 100) + "%";
+      if (recording) chunks.push(e.data);
+    };
+  }
+  if (source) source.disconnect();
+  source = ctx.createMediaStreamSource(stream);
+  source.connect(node);
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput");
+  const used = stream.getAudioTracks()[0].getSettings().deviceId;
+  $("mic").innerHTML = "";
+  devices.forEach(d => $("mic").add(new Option(d.label || d.deviceId, d.deviceId, false, d.deviceId === used)));
+}
+
+function joined() {
+  const out = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
+  let i = 0; for (const c of chunks) { out.set(c, i); i += c.length; }
+  return out;
+}
+
+async function toggle() {
+  await ctx.resume();
+  if (!recording) {
+    chunks = []; recording = true; take = null;
+    $("status").textContent = "Recording…";
+  } else {
+    recording = false; take = joined();
+    const peak = take.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    $("status").textContent = `${(take.length / ctx.sampleRate).toFixed(1)} s` +
+      (peak < 0.05 ? " · very quiet: is the right microphone selected?" : peak > 0.99 ? " · too loud (clipped): move the mic a little away" : "");
+  }
+  buttons();
+}
+
+function play() {
+  if (!take) return;
+  const buf = ctx.createBuffer(1, take.length, ctx.sampleRate);
+  buf.copyToChannel(take, 0);
+  const s = ctx.createBufferSource(); s.buffer = buf; s.connect(ctx.destination); s.start();
+}
+
+async function keep() {
+  if (!take) return;
+  const pcm = new Int16Array(take.length);
+  take.forEach((v, i) => pcm[i] = Math.max(-32768, Math.min(32767, Math.round(v * 32767))));
+  const r = await fetch(`/save?id=${encodeURIComponent(lines[current].id)}&rate=${ctx.sampleRate}`,
+                        { method: "POST", body: pcm.buffer });
+  if (!r.ok) { $("status").textContent = "Saving failed: " + await r.text(); return; }
+  lines[current].done = true;
+  take = null;
+  $("status").textContent = "Saved.";
+  next();
+}
+
+function next() {
+  const todo = lines.findIndex((l, i) => i > current && !l.done);
+  current = todo !== -1 ? todo : (lines.findIndex(l => !l.done) !== -1 ? lines.findIndex(l => !l.done) : current);
+  if (lines.every(l => l.done)) $("status").textContent = "All lines recorded. You can close this page.";
+  take = null; buttons(); render();
+}
+
+$("recBtn").onclick = toggle;
+$("playBtn").onclick = play;
+$("keepBtn").onclick = keep;
+$("nextBtn").onclick = () => { take = null; current = (current + 1) % lines.length; buttons(); render(); };
+$("mic").onchange = e => openMic(e.target.value);
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); toggle(); }
+  else if (e.key === "p" || e.key === "P") play();
+  else if (e.key === "Enter" && take && !recording) keep();
+});
+
+openMic().then(loadLines).then(buttons).catch(e => $("status").textContent = "Microphone error: " + e.message);
+</script>
+</body>
+</html>

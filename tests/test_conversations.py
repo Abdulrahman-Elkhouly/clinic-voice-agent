@@ -2,7 +2,7 @@
 
     $env:CONVO_TESTS=1; python -m pytest tests/test_conversations.py -v     (PowerShell)
 
-Opt-in (CONVO_TESTS=1) because they are slow and use the Groq quota; also needs GROQ_API_KEY.
+Opt-in (CONVO_TESTS=1) because they are slow and use the LLM provider's quota (LLM_MODEL; needs its API key).
 The LLM is not deterministic, so these check behavior (which tool was called, with what, and an
 LLM judge on the reply), not exact wording.
 """
@@ -19,25 +19,25 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "agent"))
 load_dotenv(ROOT / ".env")
+from llm_config import API_KEYS, PROVIDER  # noqa: E402
+_KEY = API_KEYS[PROVIDER]   # the conversation LLM's key (it also runs the name judge)
 
 pytestmark = [
-    pytest.mark.skipif(not (os.environ.get("CONVO_TESTS") and os.environ.get("GROQ_API_KEY")),
-                       reason="opt-in: set CONVO_TESTS=1 (needs GROQ_API_KEY)"),
+    pytest.mark.skipif(not (os.environ.get("CONVO_TESTS") and os.environ.get(_KEY)),
+                       reason=f"opt-in: set CONVO_TESTS=1 (needs {_KEY})"),
     pytest.mark.asyncio,
 ]
 
 from livekit.agents import AgentSession  # noqa: E402
-from livekit.plugins import groq  # noqa: E402
 
 from datetime import timedelta  # noqa: E402
 
-from agent import BookingAgent, CallData, ReceptionAgent  # noqa: E402
+from agent import BookingAgent, CallData, ReceptionAgent, make_llm  # noqa: E402
 from db import ClinicDB, now_qatar  # noqa: E402
 from rag import KnowledgeBase  # noqa: E402
 
-MODEL = "openai/gpt-oss-120b"   # same as the live agent
-# Groq's free tier allows 8,000 tokens per minute and each turn sends the ~2,000-token prompt,
-# so tests pause between each other. Set CONVO_TEST_PAUSE=0 on a paid tier.
+# The same LLM as the live agent (LLM_MODEL, e.g. openai:gpt-6-luna); it also judges the replies and runs the name
+# judge. On Groq's free tier (8,000 tokens a minute) tests must pause; on a paid tier set CONVO_TEST_PAUSE lower.
 PAUSE_SECONDS = float(os.environ.get("CONVO_TEST_PAUSE", "60"))       # between tests
 TURN_PAUSE_SECONDS = PAUSE_SECONDS / 2                                 # between turns (booking prompts are ~2,500 tokens)
 _first_test = True
@@ -74,7 +74,7 @@ async def reception(tmp_path, kb, start_with_booking: bool = False):
     for wd in (0, 2, 5):   # Monday, Wednesday, Saturday
         db.add_schedule(benali, wd, "09:00", "15:00", 20, date(2026, 1, 1))
     data = CallData(kb=kb, db=db)
-    async with groq.LLM(model=MODEL) as llm, AgentSession(llm=llm, userdata=data) as session:
+    async with make_llm() as llm, AgentSession(llm=llm, userdata=data) as session:
         if start_with_booking:
             data.identity.set_patient(fatima | {"full_name": "Fatima Al-Naimi"})
             await session.start(BookingAgent(fatima["patient_id"], "Fatima"))
@@ -100,30 +100,33 @@ def spoken(result) -> str:
                     if e.type == "message" and e.item.role == "assistant")
 
 
-async def test_returning_patient_with_file_number_is_verified(tmp_path, kb):
+async def test_returning_patient_verified_by_file_number_and_name_then_confirms(tmp_path, kb):
     async with reception(tmp_path, kb) as c:
         fn = " ".join(c["fatima"]["file_number"])
-        r = await say(c["session"], f"Hi, I want to book. I've been before. My file number is {fn} "
-                                    "and my date of birth is the 14th of March 1990.")
-        if not calls(r, "verify_patient"):   # the model may check the details with the caller first
-            r = await say(c["session"], "Yes, that's right.")
-        [call] = calls(r, "verify_patient")
-        assert '"1990-03-14"' in call.arguments and c["fatima"]["file_number"] in call.arguments
+        results = [await say(c["session"], f"Hi, I want to book. I have a file with you. My file number is {fn} "
+                                           "and my name is Fatima Alnaimi.")]
+        if not all_calls(results, "verify_patient"):   # the model may check the details with the caller first
+            results.append(await say(c["session"], "Yes, that's right."))
+        [call] = all_calls(results, "verify_patient")
+        assert c["fatima"]["file_number"] in call.arguments
+        assert "Al-Naimi" in spoken(results[-1]), spoken(results[-1])   # reads back the name ON FILE
+        assert c["data"].identity.patient_id is None                    # not before the caller confirms
+        results.append(await say(c["session"], "Yes, that's me."))
+        assert all_calls(results, "confirm_patient"), spoken(results[-1])
         assert c["data"].identity.patient_id == c["fatima"]["patient_id"]
-        await r.expect.contains_message(role="assistant").judge(c["llm"], intent="Greets the caller as Fatima.")
 
 
-async def test_wrong_dob_does_not_reveal_which_detail_was_wrong(tmp_path, kb):
+async def test_wrong_name_does_not_reveal_which_detail_was_wrong(tmp_path, kb):
     async with reception(tmp_path, kb) as c:
         fn = " ".join(c["fatima"]["file_number"])
-        r = await say(c["session"], f"My file number is {fn} and I was born on 2 January 1991.")
+        r = await say(c["session"], f"I have a file. My file number is {fn} and my name is Huda Saleh.")
         if not calls(r, "verify_patient"):   # the model may check the details with the caller first
             r = await say(c["session"], "Yes, that's right.")
         assert calls(r, "verify_patient")
         assert c["data"].identity.patient_id is None
         await r.expect.contains_message(role="assistant").judge(
             c["llm"], intent="Says the details don't match the records, without saying whether the file "
-                             "number or the date of birth was wrong, and without revealing any patient details.")
+                             "number or the name was wrong, and without revealing any patient details.")
 
 
 async def test_forgot_file_number_uses_dob_and_phone(tmp_path, kb):
@@ -197,16 +200,21 @@ async def test_unverified_caller_cannot_reach_booking(tmp_path, kb):
         assert not [e for e in r.events if e.type == "agent_handoff"]
         assert c["db"].list_appointments(c["fatima"]["patient_id"]) == []
         await r.expect.contains_message(role="assistant").judge(
-            c["llm"], intent="Asks for identifying details (such as a file number) before booking.")
+            c["llm"], intent="Before booking, asks whether they have a file with the clinic or it's their first "
+                             "visit, or asks for their file number. Does not ask for an ID card or ID number.")
 
 
 async def test_verified_patient_hands_off_to_booking(tmp_path, kb):
     async with reception(tmp_path, kb) as c:
         fn = " ".join(c["fatima"]["file_number"])
-        r = await say(c["session"], f"My file number is {fn}, born 14 March 1990. I'd like to book an "
-                                    "appointment with Dr. Omar Benali.")
-        results = [r] if calls(r, "start_booking") else [r, await say(c["session"], "Yes, I want to book.")]
-        assert all_calls(results, "verify_patient") and all_calls(results, "start_booking")
+        results = [await say(c["session"], f"My file number is {fn} and my name is Fatima Al-Naimi. I'd like to "
+                                           "book an appointment with Dr. Omar Benali.")]
+        for reply in ("Yes, that's me.", "Yes, I want to book."):   # confirm the name, then the booking intent
+            if all_calls(results, "start_booking"):
+                break
+            results.append(await say(c["session"], reply))
+        assert all_calls(results, "verify_patient") and all_calls(results, "confirm_patient")
+        assert all_calls(results, "start_booking")
         assert any(e.type == "agent_handoff" for res in results for e in res.events)
 
 
@@ -274,6 +282,23 @@ async def test_question_not_in_the_knowledge_base_is_not_guessed(tmp_path, kb):
                              "that information or that the service isn't offered.")
 
 
+async def test_off_topic_question_is_not_answered(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        r = await say(c["session"], "How do I make shakshouka? What ingredients do I need?")
+        await r.expect.contains_message(role="assistant").judge(
+            c["llm"], intent="Gives no recipe, ingredients, or cooking steps; says it can only help with the clinic "
+                             "and offers help with the clinic (appointments or questions).")
+
+
+async def test_arabic_off_topic_question_is_not_answered(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        r = await say(c["session"], "كيف أسوي شكشوكة؟ شو المكونات؟")
+        in_arabic([r])
+        await r.expect.contains_message(role="assistant").judge(
+            c["llm"], intent="Gives no recipe, ingredients, or cooking steps; says it can only help with the clinic "
+                             "and offers help with the clinic (appointments or questions).")
+
+
 async def test_emergency_still_comes_first(tmp_path, kb):
     async with reception(tmp_path, kb) as c:
         r = await say(c["session"], "My file number is 1 2 3 4 5 6. My husband has sudden crushing chest pain "
@@ -284,3 +309,85 @@ async def test_emergency_still_comes_first(tmp_path, kb):
         said = " ".join(spoken(r).replace(" ", " ").replace(" ", " ").lower().split())
         # Numbers are spoken digit by digit: "999", "9 9 9", or "nine nine nine"
         assert "999" in said.replace(" ", "") or "nine nine nine" in said, said
+
+
+# --- Arabic (Stage 7, text side) ---
+
+ARABIC_DIGIT = {"0": "صفر", "1": "واحد", "2": "اثنين", "3": "ثلاثة", "4": "أربعة", "5": "خمسة", "6": "ستة",
+                "7": "سبعة", "8": "ثمانية", "9": "تسعة"}
+
+
+def in_arabic(results) -> str:
+    text = " ".join(spoken(r) for r in results)
+    assert arabic_share(text) > 0.7, text
+    return text
+
+
+async def test_greeting_is_in_arabic_then_english(tmp_path, kb):
+    import asyncio
+    async with reception(tmp_path, kb) as c:
+        def greeting():   # generated in the background by on_enter, so it may not exist yet
+            return next((item.text_content for item in c["session"].history.items
+                         if getattr(item, "role", None) == "assistant"), None)
+        for _ in range(60):
+            if greeting():
+                break
+            await asyncio.sleep(0.5)
+        assert greeting(), "no greeting within 30 s"
+        share = arabic_share(greeting())
+        assert 0.2 < share < 0.9, greeting   # both languages
+
+
+async def test_arabic_caller_verified_with_spoken_digits_and_an_arabic_name(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        fn = " ".join(ARABIC_DIGIT[ch] for ch in c["fatima"]["file_number"])
+        results = [await say(c["session"], f"أبي أحجز موعد. عندي ملف عندكم، رقم ملفي {fn}، واسمي فاطمة النعيمي.")]
+        if not all_calls(results, "verify_patient"):   # the model may check the details first
+            results.append(await say(c["session"], "ايه صح."))
+        results.append(await say(c["session"], "ايه، أنا."))   # confirms the name read back from the file
+        transcript = " || ".join(spoken(r) for r in results)
+        assert all_calls(results, "verify_patient") and all_calls(results, "confirm_patient"), transcript
+        assert c["data"].identity.patient_id == c["fatima"]["patient_id"], transcript
+        assert "هوية" not in transcript, transcript   # it once asked for an ID number (رقم الهوية)
+        in_arabic(results)
+
+
+async def test_arabic_registration_stores_the_name_in_english_letters(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        results = [await say(c["session"], "أنا مريضة جديدة وأبي أسجل. اسمي سارة منصور، مواليد ٩ سبتمبر ٢٠٠١، "
+                                           "ورقم تلفوني ستة ستة صفر صفر واحد واحد اثنين اثنين.")]
+        assert c["db"].find_by_dob_phone(date(2001, 9, 9), "66001122") == []   # nothing before the read-back
+        results.append(await say(c["session"], "ايه، كل شي صحيح."))
+        if not c["db"].find_by_dob_phone(date(2001, 9, 9), "66001122"):
+            results.append(await say(c["session"], "ايه، سجلني لو سمحت."))
+        [patient] = c["db"].find_by_dob_phone(date(2001, 9, 9), "66001122")
+        assert patient["full_name"].isascii() and "sar" in patient["full_name"].lower(), patient["full_name"]
+        in_arabic(results)
+
+
+async def test_arabic_booking_with_the_doctor_named_in_arabic(tmp_path, kb):
+    async with reception(tmp_path, kb, start_with_booking=True) as c:
+        saturday = next_weekday(5)
+        r1 = await say(c["session"], f"أبي موعد عند دكتور عمر بن علي يوم السبت {saturday.day} الصبح.")
+        [check] = all_calls([r1], "check_availability") or all_calls([r1], "check_specialty_availability")
+        assert "Benali" in check.arguments or "orthopedics" in check.arguments, check.arguments
+        r2 = await say(c["session"], "أول موعد زين.")
+        assert all_calls([r2], "book_appointment"), spoken(r2)
+        r3 = await say(c["session"], "Hey.")   # how STT heard a lone "ايه": unclear, so no booking yet
+        assert not all_calls([r3], "confirm"), spoken(r3)
+        r4 = await say(c["session"], "ايه نعم، أكد الحجز.")
+        assert all_calls([r4], "confirm"), spoken(r4)
+        [appt] = c["db"].list_appointments(c["fatima"]["patient_id"])
+        assert appt["start_at"].date() == saturday
+        in_arabic([r1, r2, r4])
+        never_reads_internal_refs([r1, r2, r3, r4])
+
+
+async def test_arabic_emergency_gets_999_first(tmp_path, kb):
+    async with reception(tmp_path, kb) as c:
+        r = await say(c["session"], "زوجي عنده ألم قوي في صدره وينتشر لذراعه وما يقدر يتنفس، شو أسوي؟")
+        used = {e.item.name for e in r.events if e.type == "function_call"}
+        assert not used & {"verify_patient", "find_patient", "register_patient", "search_knowledge_base"}, used
+        said = in_arabic([r])
+        compact = said.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")).replace(" ", "")
+        assert "999" in compact or "تسعةتسعةتسعة" in compact, said

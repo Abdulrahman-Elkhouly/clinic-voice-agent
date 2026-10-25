@@ -129,20 +129,31 @@ def test_voyage_failure_becomes_unavailable(kb_dir, client):
         KnowledgeBase(client, BrokenEmbedder()).search("friday")
 
 
-@pytest.mark.parametrize("text, arabic", [
-    ("وين أوقف سيارتي لما أجيكم؟", True),
-    ("عندكم تأمين QLM؟", True),            # an insurer's English name inside an Arabic question
-    ("Where do I park?", False),
-    ("Is Dr. Benali available? شكرا", False),
+@pytest.mark.parametrize("text, language", [
+    ("وين أوقف سيارتي لما أجيكم؟", "ar"),
+    ("عندكم تأمين QLM؟", "ar"),            # an insurer's English name inside an Arabic question
+    ("Where do I park?", "en"),
+    ("Is Dr. Benali available? شكرا", "en"),
 ])
-def test_caller_language_is_detected_from_the_last_message(text, arabic):
+def test_caller_language_is_detected_from_the_last_message(text, language):
     from livekit.agents import llm
     import agent   # noqa: E402
     ctx = llm.ChatContext()
-    ctx.add_message(role="user", content="Hello")
-    ctx.add_message(role="assistant", content="Welcome to Izghawa Medical Center.")
+    ctx.add_message(role="assistant", content="هلا والله، مركز إزغاوة الطبي. Welcome to Izghawa Medical Center.")
+    ctx.add_message(role="user", content="مرحبا")
     ctx.add_message(role="user", content=text)
-    assert agent.caller_speaks_arabic(ctx) == arabic
+    assert agent.caller_language(ctx) == language
+
+
+def test_a_reply_without_words_keeps_the_language_and_nothing_before_the_caller_speaks():
+    from livekit.agents import llm
+    import agent   # noqa: E402
+    ctx = llm.ChatContext()
+    ctx.add_message(role="assistant", content="هلا والله. Welcome to Izghawa Medical Center.")
+    assert agent.caller_language(ctx) is None   # the greeting itself: no reminder
+    ctx.add_message(role="user", content="أبي أتحقق من ملفي")
+    ctx.add_message(role="user", content="55123456")
+    assert agent.caller_language(ctx) == "ar"
 
 
 def test_agent_tool_offers_staff_when_search_fails(kb_dir, client):

@@ -58,10 +58,46 @@ def test_times_are_worded_for_speech():
 
 # --- Availability ---
 
-def test_offers_three_earliest_slots_with_booking_keys(c):
+def test_a_full_day_is_described_by_its_free_hours_not_a_list(c):
+    # "9:00, 9:20 or 9:40" sounded like the only times (2026-10-22): a busy-free day is told as its free hours
     msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali", now=NOW)
-    assert "Saturday 17 October at 9:00 in the morning" in msg
-    assert msg.count("[book with:") == 3 and "start='2026-10-17 09:40'" in msg and "More times exist" in msg
+    assert "free from 9:00 in the morning to 2:40 in the afternoon" in msg and "every 20 minutes" in msg
+    assert "9:20" not in msg and "ask what time suits" in msg
+
+
+def test_a_gap_splits_the_free_hours(c):
+    book_and_confirm(c, c["other"], "2026-10-17 11:00")
+    msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali", now=NOW)
+    assert "from 9:00 in the morning to 10:40 in the morning and from 11:20 in the morning to 2:40" in msg
+
+
+def test_a_day_with_few_times_left_names_them(c):
+    for t in ["09:00", "09:20", "09:40", "10:00", "10:20", "10:40", "11:00", "11:20", "11:40", "12:00", "12:20",
+              "12:40", "13:00", "13:20", "13:40"]:
+        c["db"].book_slot(c["other"], c["benali"], at(date(2026, 10, 17), t), "reception", now=NOW)
+    msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali", now=NOW)
+    assert "only these times" in msg and msg.count("[book with:") == 3
+    assert "start='2026-10-17 14:00'" in msg and "start='2026-10-17 14:40'" in msg
+
+
+def test_a_range_of_days_suggests_the_earliest_day_first(c):
+    msg = booking.check_availability(c["db"], c["adult"], "2026-10-13", "2026-10-31",
+                                     doctor_name="Dr. Omar Benali", now=NOW)
+    assert "Suggest the earliest day first (Wednesday 14 October)" in msg
+    assert "describe its free hours only once the caller has chosen a day" in msg
+
+
+def test_booking_a_time_inside_the_free_hours(c):
+    msg = booking.book(c["db"], BookingState(), c["adult"], "Dr. Omar Benali", "2026-10-17 10:20", CALL,
+                       user_turns=1, now=NOW)
+    assert "nothing is booked yet" in msg and "10:20" in msg
+
+
+def test_booking_a_taken_time_offers_the_nearest_ones_in_the_same_reply(c):
+    book_and_confirm(c, c["other"], "2026-10-17 13:20")
+    msg = booking.book(c["db"], BookingState(), c["adult"], "Dr. Omar Benali", "2026-10-17 13:20", CALL,
+                       user_turns=1, now=NOW)
+    assert "isn't free" in msg and "start='2026-10-17 13:00'" in msg and "start='2026-10-17 13:40'" in msg
 
 
 def test_doctor_names_are_matched_without_the_title_or_case(c):
@@ -77,12 +113,34 @@ def test_unknown_doctor(c):
 def test_part_of_day_filters_slots(c):
     msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali",
                                      part_of_day="afternoon", now=NOW)
-    assert "at 12:00 in the afternoon" in msg and "in the morning" not in msg
+    assert "free from 12:00 in the afternoon to 2:40 in the afternoon" in msg and "in the morning" not in msg
 
 
 def test_nothing_in_range_offers_the_next_available_dates(c):
     msg = booking.check_availability(c["db"], c["adult"], "2026-10-18", doctor_name="Dr. Omar Benali", now=NOW)
     assert "Nothing is free in the dates asked for" in msg and "Monday 19 October" in msg
+
+
+def test_a_specific_time_is_offered_even_when_it_is_not_among_the_earliest(c):
+    # the call that found this: afternoon gave 12:00, 12:20, 12:40, and 13:20 looked unavailable
+    msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali",
+                                     part_of_day="afternoon", time_text="13:20", now=NOW)
+    assert msg.startswith("That time is free") and "start='2026-10-17 13:20'" in msg.split(";")[0]
+
+
+def test_a_taken_time_offers_the_nearest_ones(c):
+    booking.book(c["db"], BookingState(), c["other"], "Dr. Omar Benali", "2026-10-17 13:20", "other-call",
+                 user_turns=1, now=NOW)   # someone else is holding 13:20
+    msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali",
+                                     time_text="13:20", now=NOW)
+    assert "isn't free" in msg and "13:20'" not in msg
+    assert "start='2026-10-17 13:00'" in msg and "start='2026-10-17 13:40'" in msg
+
+
+def test_a_badly_written_time_is_refused(c):
+    msg = booking.check_availability(c["db"], c["adult"], "2026-10-17", doctor_name="Dr. Omar Benali",
+                                     time_text="1:20 pm", now=NOW)
+    assert "HH:MM" in msg
 
 
 def test_specialty_search_with_gender(c):
